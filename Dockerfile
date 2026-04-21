@@ -3,7 +3,10 @@ ARG BUILD_IMAGE=docker.io/golang:1.25.9@sha256:5ab234a9519e05043f4a97a505a59f21d
 ARG BASE_IMAGE=gcr.io/distroless/static:nonroot@sha256:9ecc53c269509f63c69a266168e4a687c7eb8c0cfd753bd8bfcaa4f58a90876f
 
 # Build the manager binary
-FROM $BUILD_IMAGE AS builder
+FROM --platform=$BUILDPLATFORM $BUILD_IMAGE AS builder
+
+ARG TARGETOS
+ARG TARGETARCH
 
 WORKDIR /workspace
 
@@ -14,11 +17,14 @@ COPY apis/go.mod apis/go.sum apis/
 COPY hack/tools/go.mod hack/tools/go.sum hack/tools/
 COPY pkg/hardwareutils/go.mod pkg/hardwareutils/go.sum pkg/hardwareutils/
 RUN go mod download
-ARG LDFLAGS=-s -w -extldflags=-static
+
+ARG SOURCE_GIT_COMMIT
+ARG BUILD_VERSION
+ARG LDFLAGS="-s -w -extldflags=-static" 
+ENV VERSION_URI="github.com/metal3-io/baremetal-operator/pkg/version"
 
 COPY . .
-ARG ARCH=amd64
-RUN CGO_ENABLED=0 GOOS=linux GOARCH=${ARCH} GO111MODULE=on go build -a -ldflags "${LDFLAGS}" -o baremetal-operator main.go
+RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} GO111MODULE=on go build -a -ldflags "${LDFLAGS} -X ${VERSION_URI}.Raw=${BUILD_VERSION} -X ${VERSION_URI}.Commit=${SOURCE_GIT_COMMIT} -X ${VERSION_URI}.BuildTime=$(date '+%Y-%m-%dT%H:%M:%S%z')" -o baremetal-operator main.go
 
 # Copy the controller-manager into a thin image
 # BMO has a dependency preventing us to use the static one,
