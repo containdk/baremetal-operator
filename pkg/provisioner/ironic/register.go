@@ -156,9 +156,7 @@ func (p *ironicProvisioner) Register(ctx context.Context, data provisioner.Manag
 		updater.SetTopLevelOpt("disable_power_off", data.DisablePowerOff, ironicNode.DisablePowerOff)
 
 		if p.config.useFailureDomainAsConductorGroup {
-			if labelValue, ok := p.objectMeta.Labels[hostclaim.FailureDomainLabelName]; ok {
-				updater.SetTopLevelOpt("conductor_group", labelValue, ironicNode.ConductorGroup)
-			}
+			updater.SetTopLevelOpt("conductor_group", p.objectMeta.Labels[hostclaim.FailureDomainLabelName], ironicNode.ConductorGroup)
 		}
 
 		// Update cpu_arch in Properties if specified.
@@ -278,9 +276,7 @@ func (p *ironicProvisioner) enrollNode(ctx context.Context, data provisioner.Man
 	}
 
 	if p.config.useFailureDomainAsConductorGroup {
-		if labelValue, ok := p.objectMeta.Labels[hostclaim.FailureDomainLabelName]; ok {
-			nodeCreateOpts.ConductorGroup = labelValue
-		}
+		nodeCreateOpts.ConductorGroup = p.objectMeta.Labels[hostclaim.FailureDomainLabelName]
 	}
 
 	ironicNode, err = nodes.Create(ctx, p.client, nodeCreateOpts).Extract()
