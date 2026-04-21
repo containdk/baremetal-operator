@@ -29,9 +29,9 @@ func TestEnrollWithConductorGroup(t *testing.T) {
 			expectedConductorGroup: "zone-1",
 		},
 		{
-			name:             "flag enabled, label missing",
-			useFailureDomain: true,
-			labels:           map[string]string{},
+			name:                   "flag enabled, label missing",
+			useFailureDomain:       true,
+			labels:                 map[string]string{},
 			expectedConductorGroup: "",
 		},
 		{
