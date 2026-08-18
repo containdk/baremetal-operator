@@ -111,7 +111,7 @@ func (p *demoProvisioner) Register(_ context.Context, _ provisioner.ManagementAc
 	return
 }
 
-func (p *demoProvisioner) PreprovisioningImageFormats() ([]metal3api.ImageFormat, error) {
+func (p *demoProvisioner) PreprovisioningImageFormats(_ context.Context) ([]metal3api.ImageFormat, error) {
 	return nil, nil
 }
 
@@ -287,7 +287,7 @@ func (p *demoProvisioner) Delete(_ context.Context) (result provisioner.Result, 
 // for the target system.  It may be called multiple times,
 // and should return true for its dirty  flag until the
 // deletion operation is completed.
-func (p *demoProvisioner) Detach(_ context.Context) (result provisioner.Result, err error) {
+func (p *demoProvisioner) Detach(_ context.Context, _ bool) (result provisioner.Result, err error) {
 	p.log.Info("detaching host")
 	return result, nil
 }
@@ -304,11 +304,6 @@ func (p *demoProvisioner) PowerOn(_ context.Context, _ bool) (result provisioner
 func (p *demoProvisioner) PowerOff(_ context.Context, _ metal3api.RebootMode, _ bool, _ metal3api.AutomatedCleaningMode) (result provisioner.Result, err error) {
 	p.log.Info("powering off host")
 	return result, nil
-}
-
-// TryInit always returns true for the demo provisioner.
-func (p *demoProvisioner) TryInit(_ context.Context) (result bool, err error) {
-	return true, nil
 }
 
 func (p *demoProvisioner) GetFirmwareSettings(_ context.Context, _ bool) (settings metal3api.SettingsMap, schema map[string]metal3api.SettingSchema, err error) {

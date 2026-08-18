@@ -21,9 +21,9 @@ cd "${REPO_ROOT}" || exit 1
 
 BMC_PROTOCOL="${BMC_PROTOCOL:-"redfish-virtualmedia"}"
 if [[ "${BMC_PROTOCOL}" == "redfish" ]] || [[ "${BMC_PROTOCOL}" == "redfish-virtualmedia" ]]; then
-  BMO_E2E_EMULATOR="sushy-tools"
+  export BMO_E2E_EMULATOR="sushy-tools"
 elif [[ "${BMC_PROTOCOL}" == "ipmi" ]]; then
-  BMO_E2E_EMULATOR="vbmc"
+  export BMO_E2E_EMULATOR="vbmc"
 else
   echo "FATAL: Invalid BMC protocol specified: ${BMC_PROTOCOL}"
   exit 1
@@ -35,6 +35,13 @@ echo "BMO_E2E_EMULATOR=${BMO_E2E_EMULATOR}"
 export E2E_CONF_FILE="${REPO_ROOT}/test/e2e/config/ironic.yaml"
 export E2E_BMCS_CONF_FILE="${REPO_ROOT}/test/e2e/config/bmcs-${BMC_PROTOCOL}.yaml"
 
+VBMC_IMAGE="${VBMC_IMAGE:-quay.io/metal3-io/vbmc}"
+SUSHY_EMULATOR_IMAGE="${SUSHY_EMULATOR_IMAGE:-quay.io/metal3-io/sushy-tools:latest}"
+SUSHY_EMULATOR_PORT="${SUSHY_EMULATOR_PORT:-8000}"
+
+# make test-e2e runs the fixture tests by default and skips some tests
+# that don't make sense in that context. We need to override.
+export GINKGO_SKIP_LABELS="${GINKGO_SKIP_LABELS:-}"
 GINKGO_FOCUS="${GINKGO_FOCUS:-}"
 
 case "${GINKGO_FOCUS,,}" in
@@ -58,7 +65,7 @@ export PATH="/usr/local/go/bin:${PATH}"
 "${REPO_ROOT}/hack/e2e/ensure_yq.sh"
 
 sudo apt-get update
-sudo apt-get install -y libvirt-dev pkg-config gettext-base
+sudo apt-get install -y libvirt-dev pkg-config gettext-base curl
 
 # Increase inotify limits to prevent "too many open files" errors.
 # Kind nodes (Docker containers running systemd) consume inotify resources heavily.
@@ -71,72 +78,19 @@ IMG=quay.io/metal3-io/baremetal-operator IMG_TAG=e2e make docker
 
 # Build vbmctl
 make build-vbmctl
-# Create VMs to act as BMHs in the tests and the libvirt network
-./bin/vbmctl -c "${REPO_ROOT}/test/e2e/config/vbmctl.yaml" create bml
-
-# We need to create veth pair to connect metal3 net (defined above with vbmctl)
-# and kind docker subnet. Let us start by creating a docker network with
-# pre-defined name for bridge, so that we can configure the veth pair
-# correctly. Also assume that if kind net exists, it is created by us.
-if ! docker network list | grep kind; then
-    # These options are used by kind itself. It uses docker default mtu and
-    # generates ipv6 subnet ULA, but we can fix the ULA. Only addition to kind
-    # options is the network bridge name.
-    docker network create -d=bridge \
-        -o com.docker.network.bridge.enable_ip_masquerade=true \
-        -o com.docker.network.driver.mtu=1500 \
-        -o com.docker.network.bridge.name="kind-bridge" \
-        --ipv6 --subnet "fc00:f853:ccd:e793::/64" \
-        kind
-fi
-docker network list
-
-# Next create the veth pair
-if ! ip a | grep metalend; then
-    sudo ip link add metalend type veth peer name kindend
-    sudo ip link set metalend master metal3
-    sudo ip link set kindend master kind-bridge
-    sudo ip link set metalend up
-    sudo ip link set kindend up
-fi
-ip a
-
-# Then we need to set routing rules as well
-if ! sudo iptables -L FORWARD -v -n | grep kind-bridge; then
-    sudo iptables -I FORWARD -i kind-bridge -o metal3 -j ACCEPT
-    sudo iptables -I FORWARD -i metal3 -o kind-bridge -j ACCEPT
-fi
-sudo iptables -L FORWARD -n -v
+sudo setcap cap_net_admin+epi ./bin/vbmctl
 
 # This IP is defined by the network we created above. It is sushy-tools / image
 # server endpoint, not ironic.
-IP_ADDRESS="192.168.222.1"
+export IP_ADDRESS="192.168.222.1"
 
+# E2E emulator configuration variables
 if [[ "${BMO_E2E_EMULATOR}" == "vbmc" ]]; then
-  # Start VBMC
-  docker start vbmc || docker run --name vbmc --network host -d \
-    -v /var/run/libvirt/libvirt-sock:/var/run/libvirt/libvirt-sock \
-    -v /var/run/libvirt/libvirt-sock-ro:/var/run/libvirt/libvirt-sock-ro \
-    quay.io/metal3-io/vbmc
-
-  readarray -t BMCS < <(yq e -o=j -I=0 '.[]' "${E2E_BMCS_CONF_FILE}")
-  for bmc in "${BMCS[@]}"; do
-    address=$(echo "${bmc}" | jq -r '.address')
-    hostName=$(echo "${bmc}" | jq -r '.name')
-    vbmc_port="${address##*:}"
-    "${REPO_ROOT}/tools/bmh_test/vm2vbmc.sh" "${hostName}" "${vbmc_port}" "${IP_ADDRESS}"
-  done
-
+  export BMO_E2E_IMAGE="${VBMC_IMAGE}"
+  export BMO_E2E_LISTEN_PORT="0"
 elif [[ "${BMO_E2E_EMULATOR}" == "sushy-tools" ]]; then
-  # Sushy-tools variables
-  SUSHY_EMULATOR_FILE="${REPO_ROOT}"/test/e2e/sushy-tools/sushy-emulator.conf
-  # Start sushy-tools
-  docker start sushy-tools || docker run --name sushy-tools -d --network host \
-    -v "${SUSHY_EMULATOR_FILE}":/etc/sushy/sushy-emulator.conf:Z \
-    -v /var/run/libvirt:/var/run/libvirt:Z \
-    -e SUSHY_EMULATOR_CONFIG=/etc/sushy/sushy-emulator.conf \
-    quay.io/metal3-io/sushy-tools:latest sushy-emulator
-
+  export BMO_E2E_IMAGE="${SUSHY_EMULATOR_IMAGE}"
+  export BMO_E2E_LISTEN_PORT="${SUSHY_EMULATOR_PORT}"
 else
   echo "FATAL: Invalid e2e emulator specified: ${BMO_E2E_EMULATOR}"
   exit 1
@@ -144,16 +98,30 @@ fi
 
 # Image server variables
 CIRROS_VERSION="0.6.2"
+SYSRESCUE_VERSION="11.00"
 IMAGE_FILE="cirros-${CIRROS_VERSION}-x86_64-disk.img"
+ISO_FILE="systemrescue-${SYSRESCUE_VERSION}-amd64.iso"
 export IMAGE_CHECKSUM="c8fc807773e5354afe61636071771906"
 export IMAGE_URL="http://${IP_ADDRESS}/${IMAGE_FILE}"
-IMAGE_DIR="${REPO_ROOT}/test/e2e/images"
+export IMAGE_DIR="${REPO_ROOT}/test/e2e/images"
 mkdir -p "${IMAGE_DIR}"
+
+cache_image() {
+    wget --no-verbose -P "${IMAGE_DIR}/" "$@"
+}
+
+ARTIFACTORY_ROOT=https://artifactory.nordix.org/artifactory
 
 ## Download disk images
 if [[ ! -f "${IMAGE_DIR}/${IMAGE_FILE}" ]]; then
-    wget --quiet -P "${IMAGE_DIR}/" https://artifactory.nordix.org/artifactory/metal3/images/iso/"${IMAGE_FILE}"
-    wget --quiet -P "${IMAGE_DIR}/" https://artifactory.nordix.org/artifactory/metal3/images/sysrescue/systemrescue-11.00-amd64.iso
+    if ! cache_image "${ARTIFACTORY_ROOT}/metal3/images/iso/${IMAGE_FILE}"; then
+        cache_image https://download.cirros-cloud.net/"${CIRROS_VERSION}/${IMAGE_FILE}"
+    fi
+fi
+if [[ ! -f "${IMAGE_DIR}/${ISO_FILE}" ]]; then
+    if ! cache_image "${ARTIFACTORY_ROOT}/metal3/images/sysrescue/${ISO_FILE}"; then
+        wget --no-verbose -O "${IMAGE_DIR}/${ISO_FILE}" https://sourceforge.net/projects/systemrescuecd/files/sysresccd-x86/"${SYSRESCUE_VERSION}"/"${ISO_FILE}"/download
+    fi
 fi
 
 ## Download IPA (Ironic Python Agent) image
@@ -161,13 +129,79 @@ fi
 # This saves time, especially during ironic upgrade tests and also
 # gives us early failure in case there is some issue downloading it.
 IPA_FILE="ipa-centos9-master.tar.gz"
-IPA_BASEURI=https://artifactory.nordix.org/artifactory/openstack-remote-cache/ironic-python-agent/dib/
+IPA_BASEURI="${ARTIFACTORY_ROOT}/openstack-remote/ironic-python-agent/dib/"
 if [[ ! -f "${IMAGE_DIR}/${IPA_FILE}" ]]; then
-    wget --quiet -P "${IMAGE_DIR}/" "${IPA_BASEURI}/${IPA_FILE}"
+    if ! cache_image "${IPA_BASEURI}/${IPA_FILE}"; then
+        cache_image https://tarballs.opendev.org/openstack/ironic-python-agent/dib/"${IPA_FILE}"
+    fi
 fi
 
-## Start the image server
-./bin/vbmctl create image-server --host-port 80 --image-dir "${IMAGE_DIR}" --name "vbmctl-image-server-e2e"
+# shellcheck disable=SC2016
+envsubst '${BMO_E2E_EMULATOR},${IP_ADDRESS},${BMO_E2E_IMAGE},${BMO_E2E_LISTEN_PORT},${IMAGE_DIR}' < \
+  "${REPO_ROOT}/test/e2e/config/vbmctl.yaml.tmpl" > \
+  "${REPO_ROOT}/test/e2e/config/vbmctl.yaml"
+
+# Create VMs to act as BMHs in the tests and the libvirt network. Create
+# also image server and E2E emulator containers.
+./bin/vbmctl -c "${REPO_ROOT}/test/e2e/config/vbmctl.yaml" create bml
+
+# Wait for the sushy-tools BMC emulator to become reachable on the provisioning
+# IP. sushy-tools may start before the provisioning bridge IP is assigned,
+# failing to bind ("Cannot assign requested address"). If Ironic later tries to
+# register a BMH before the emulator is listening it fails with
+# "Connection refused", which surfaces much later as an opaque BMH registration
+# error. Poll the Redfish endpoint, restarting the container if needed, and fail
+# loudly if it never comes up
+wait_for_sushy_tools() {
+  local redfish_url="http://${IP_ADDRESS}:${BMO_E2E_LISTEN_PORT}/redfish/v1/"
+  local container attempts=0 max_attempts=30
+
+  # Detect the sushy-tools container name (vbmctl may name it with or without an
+  # "-e2e" suffix depending on version), so the restart is not silently skipped.
+  for name in vbmctl-sushy-tools vbmctl-sushy-tools-e2e; do
+    if docker inspect "${name}" &>/dev/null; then
+      container="${name}"
+      break
+    fi
+  done
+  if [[ -z "${container:-}" ]]; then
+    echo "ERROR: sushy-tools BMC emulator container not found" >&2
+    docker ps -a --format '{{.Names}}' | grep -i sushy >&2 || true
+    return 1
+  fi
+
+  echo "Waiting for sushy-tools (${container}) to serve ${redfish_url}..."
+  while (( attempts < max_attempts )); do
+    if curl -sSf --connect-timeout 3 --max-time 5 "${redfish_url}" > /dev/null; then
+      echo "sushy-tools is reachable."
+      return 0
+    fi
+    # After every 5 attempts, restart to recover from the bind race.
+    attempts=$((attempts + 1))
+    if (( attempts < max_attempts && attempts % 5 == 0 )); then
+      echo "sushy-tools not reachable yet; restarting ${container} to pick up the bridge IP..."
+      docker restart "${container}" || true
+    fi
+    sleep 2
+  done
+
+  echo "ERROR: sushy-tools did not become reachable at ${redfish_url}" >&2
+  docker logs --tail 50 "${container}" >&2 || true
+  return 1
+}
+
+# Need to do some extra setup for the vbmc emulator
+if [[ "${BMO_E2E_EMULATOR}" == "vbmc" ]]; then
+  readarray -t BMCS < <(yq e -o=j -I=0 '.[]' "${E2E_BMCS_CONF_FILE}")
+  for bmc in "${BMCS[@]}"; do
+    address=$(echo "${bmc}" | jq -r '.address')
+    hostName=$(echo "${bmc}" | jq -r '.name')
+    vbmc_port="${address##*:}"
+    "${REPO_ROOT}/tools/bmh_test/vm2vbmc.sh" "${hostName}" "${vbmc_port}" "${IP_ADDRESS}"
+  done
+elif [[ "${BMO_E2E_EMULATOR}" == "sushy-tools" ]]; then
+  wait_for_sushy_tools
+fi
 
 # Generate ssh key pair for verifying provisioned BMHs
 if [[ ! -f "${IMAGE_DIR}/ssh_testkey" ]]; then
@@ -180,7 +214,7 @@ pub_ssh_key=$(cut -d " " -f "1,2" "${IMAGE_DIR}/ssh_testkey.pub")
 # We use the systemrescue ISO and their script for customizing it.
 if [[ ! -f "${IMAGE_DIR}/sysrescue-out.iso" ]];then
     pushd "${IMAGE_DIR}"
-    wget -O sysrescue-customize https://gitlab.com/systemrescue/systemrescue-sources/-/raw/main/airootfs/usr/share/sysrescue/bin/sysrescue-customize?inline=false
+    wget --no-verbose -O sysrescue-customize https://gitlab.com/systemrescue/systemrescue-sources/-/raw/main/airootfs/usr/share/sysrescue/bin/sysrescue-customize?inline=false
     chmod +x sysrescue-customize
 
     mkdir -p recipe/iso_add/sysrescue.d
@@ -194,7 +228,7 @@ sysconfig:
         "test@example.com": "${pub_ssh_key}"
 EOF
 
-    ./sysrescue-customize --auto --recipe-dir recipe --source systemrescue-11.00-amd64.iso --dest=sysrescue-out.iso
+    ./sysrescue-customize --auto --recipe-dir recipe --source "${ISO_FILE}" --dest=sysrescue-out.iso
     popd
 fi
 export ISO_IMAGE_URL="http://${IP_ADDRESS}/sysrescue-out.iso"
@@ -202,9 +236,9 @@ export ISO_IMAGE_URL="http://${IP_ADDRESS}/sysrescue-out.iso"
 # Generate credentials
 BMO_OVERLAYS=(
   "${REPO_ROOT}/config/overlays/e2e"
-  "${REPO_ROOT}/config/overlays/e2e-release-0.10"
   "${REPO_ROOT}/config/overlays/e2e-release-0.11"
   "${REPO_ROOT}/config/overlays/e2e-release-0.12"
+  "${REPO_ROOT}/config/overlays/e2e-release-0.13"
 )
 
 IRONIC_USERNAME="$(uuidgen)"

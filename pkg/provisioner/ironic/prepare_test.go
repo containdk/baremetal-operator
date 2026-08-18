@@ -30,6 +30,7 @@ func (r *RAIDTestBMC) ManagementInterface() string                   { return ""
 func (r *RAIDTestBMC) PowerInterface() string                        { return "" }
 func (r *RAIDTestBMC) RAIDInterface() string                         { return "" }
 func (r *RAIDTestBMC) VendorInterface() string                       { return "" }
+func (r *RAIDTestBMC) InspectInterface() string                      { return "" }
 func (r *RAIDTestBMC) SupportsSecureBoot() bool                      { return false }
 func (r *RAIDTestBMC) RequiresProvisioningNetwork() bool             { return true }
 func (r *RAIDTestBMC) BuildBIOSSettings(_ *bmc.FirmwareConfig) ([]map[string]string, error) {
@@ -72,7 +73,7 @@ func TestPrepare(t *testing.T) {
 			unprepared:           true,
 			existRaidConfig:      true,
 			expectedStarted:      true,
-			expectedRequestAfter: 10,
+			expectedRequestAfter: 3,
 			expectedDirty:        true,
 		},
 		{
@@ -95,7 +96,7 @@ func TestPrepare(t *testing.T) {
 			unprepared:           true,
 			existRaidConfig:      true,
 			expectedStarted:      false,
-			expectedRequestAfter: 10,
+			expectedRequestAfter: 3,
 			expectedDirty:        true,
 		},
 		{
@@ -117,7 +118,7 @@ func TestPrepare(t *testing.T) {
 			unprepared:           true,
 			existRaidConfig:      true,
 			expectedStarted:      false,
-			expectedRequestAfter: 10,
+			expectedRequestAfter: 3,
 			expectedDirty:        true,
 		},
 		{

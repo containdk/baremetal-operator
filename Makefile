@@ -4,7 +4,7 @@ GO_TEST_FLAGS = $(TEST_FLAGS)
 DEBUG = --debug
 COVER_PROFILE = cover.out
 GO := $(shell type -P go)
-GO_VERSION ?= 1.25.9
+GO_VERSION ?= 1.26.5
 
 ROOT_DIR := $(shell dirname $(realpath $(firstword $(MAKEFILE_LIST))))
 
@@ -33,7 +33,7 @@ CONTAINER_RUNTIME = docker
 SOURCE_GIT_COMMIT ?= $(shell git rev-parse --short HEAD)
 BUILD_VERSION ?= $(shell git describe --always --abbrev=40 --dirty)
 VERSION_URI = "github.com/metal3-io/baremetal-operator/pkg/version"
-export LDFLAGS="-X $(VERSION_URI).Raw=${BUILD_VERSION} \
+LDFLAGS = "-X $(VERSION_URI).Raw=${BUILD_VERSION} \
                 -X $(VERSION_URI).Commit=${SOURCE_GIT_COMMIT} \
                 -X $(VERSION_URI).BuildTime=$(shell date +%Y-%m-%dT%H:%M:%S%z)"
 
@@ -49,9 +49,12 @@ export GOFLAGS=
 #
 # Ginkgo configuration.
 #
+# We default to fixture tests, since they are fast and require little
+# both in terms of resources and tooling.
+# Note that some tests may not make sense for fixture, so we skip them.
 GINKGO_FOCUS ?=
 GINKGO_SKIP ?=
-GINKGO_SKIP_LABELS ?=
+GINKGO_SKIP_LABELS ?= automated-cleaning
 GINKGO_NODES ?= 2
 GINKGO_TIMEOUT ?= 3h
 GINKGO_POLL_PROGRESS_AFTER ?= 60m
@@ -195,20 +198,20 @@ manifest-lint: ## Run manifest validation
 build: generate manifests manager tools build-e2e ## Build everything
 
 .PHONY: manager
-manager: generate lint ## Build manager binary
+manager: generate lint ironic-plugin demo-plugin ## Build manager binary and bundled provisioner plugins
 	go build -ldflags $(LDFLAGS) -o bin/$(OPERATOR_NAME) main.go
 
 .PHONY: run
-run: generate lint manifests ## Run against the configured Kubernetes cluster in ~/.kube/config
-	go run -ldflags $(LDFLAGS) ./main.go -namespace=$(RUN_NAMESPACE) -dev -webhook-port=0 $(RUN_FLAGS)
+run: generate lint manifests ironic-plugin ## Run against the configured Kubernetes cluster in ~/.kube/config
+	PROVISIONER_PLUGIN_DIR=$(BIN_DIR) go run -ldflags $(LDFLAGS) ./main.go -namespace=$(RUN_NAMESPACE) -dev -provisioner=ironic -webhook-port=0 $(RUN_FLAGS)
 
 .PHONY: demo
-demo: generate lint manifests ## Run in demo mode
-	go run -ldflags $(LDFLAGS) ./main.go -namespace=$(RUN_NAMESPACE) -dev -demo-mode -webhook-port=0 $(RUN_FLAGS)
+demo: generate lint manifests demo-plugin ## Run in demo mode
+	PROVISIONER_PLUGIN_DIR=$(BIN_DIR) go run -ldflags $(LDFLAGS) ./main.go -namespace=$(RUN_NAMESPACE) -dev -provisioner=demo -webhook-port=0 $(RUN_FLAGS)
 
 .PHONY: run-test-mode
 run-test-mode: generate lint manifests ## Run against the configured Kubernetes cluster in ~/.kube/config
-	go run -ldflags $(LDFLAGS) ./main.go -namespace=$(RUN_NAMESPACE) -dev -test-mode -webhook-port=0 $(RUN_FLAGS)
+	go run -ldflags $(LDFLAGS) ./main.go -namespace=$(RUN_NAMESPACE) -dev -provisioner=fixture -webhook-port=0 $(RUN_FLAGS)
 
 .PHONY: install
 install: $(KUSTOMIZE) manifests ## Install CRDs into a cluster
@@ -237,12 +240,17 @@ deploy-cli:
 build-e2e:
 	cd test; go build --tags=e2e ./...
 
+# output path and ldflags for vbmctl binary. Overridable so the release
+# build can retarget the output (see release-vbmctl)
+VBMCTL_OUT ?= $(abspath $(BIN_DIR)/vbmctl)
+VBMCTL_LDFLAGS ?= "-X github.com/metal3-io/baremetal-operator/test/vbmctl/pkg/config.Version=${BUILD_VERSION}"
+
 .PHONY: build-vbmctl
 build-vbmctl:
-	cd test; go build --tags=e2e,vbmctl -ldflags $(LDFLAGS) -o $(abspath $(BIN_DIR)/vbmctl) ./vbmctl/cmd/vbmctl
+	cd test; CGO_ENABLED=1 go build --tags=e2e,vbmctl -ldflags $(VBMCTL_LDFLAGS) -o $(VBMCTL_OUT) ./vbmctl/cmd/vbmctl
 
 .PHONY: unit-vbmctl
-unit-vbmctl: ## Run vbmctl unit tests
+unit-vbmctl: # Run unit tests for vbmctl
 	cd test && go test --tags=e2e,vbmctl $(GO_TEST_FLAGS) ./vbmctl/...
 
 .PHONY: manifests
@@ -250,7 +258,8 @@ manifests: manifests-generate manifests-kustomize ## Generate manifests e.g. CRD
 
 .PHONY: manifests-generate
 manifests-generate: $(CONTROLLER_GEN)
-	cd apis; $(abspath $<) $(CRD_OPTIONS) rbac:roleName=manager-role webhook paths="./..." output:webhook:dir=../config/base/webhook/ output:crd:artifacts:config=../config/base/crds/bases
+	cd apis; $(abspath $<) $(CRD_OPTIONS) paths="./..." output:crd:artifacts:config=../config/base/crds/bases
+	cd internal/webhooks; $(abspath $<) rbac:roleName=manager-role webhook paths="./..." output:webhook:dir=../../config/base/webhook/
 	$< rbac:roleName=manager-role paths="./..." output:rbac:artifacts:config=config/base/rbac
 
 .PHONY: manifests-kustomize
@@ -315,8 +324,49 @@ docker-debug: generate manifests ## Build the docker image with debug info
 	--build-arg ARCH=$(ARCH) \
 	--build-arg http_proxy=$(http_proxy) \
 	--build-arg https_proxy=$(https_proxy) \
-	--build-arg LDFLAGS="-extldflags=-static" \
+	--build-arg LDFLAGS="" \
 	. -t ${IMG}-$(ARCH):${IMG_TAG}
+
+## --------------------------------------
+## Plugin / SDK Targets
+## --------------------------------------
+
+IRONIC_PLUGIN_DIR = pkg/provisioner/ironic/plugin
+IRONIC_PLUGIN_SO = bin/ironic-provisioner.so
+DEMO_PLUGIN_DIR = pkg/provisioner/demo/plugin
+DEMO_PLUGIN_SO = bin/demo-provisioner.so
+
+.PHONY: ironic-plugin
+ironic-plugin: ## Build the ironic provisioner plugin .so locally
+	CGO_ENABLED=1 go build -buildmode=plugin -ldflags $(LDFLAGS) -o $(IRONIC_PLUGIN_SO) ./$(IRONIC_PLUGIN_DIR)/
+
+.PHONY: demo-plugin
+demo-plugin: ## Build the demo provisioner plugin .so locally
+	CGO_ENABLED=1 go build -buildmode=plugin -ldflags $(LDFLAGS) -o $(DEMO_PLUGIN_SO) ./$(DEMO_PLUGIN_DIR)/
+
+.PHONY: docker-build-sdk
+docker-build-sdk: ## Build the BMO SDK image for authoring custom provisioner plugins
+	$(CONTAINER_RUNTIME) build --platform=linux/$(ARCH) \
+	--build-arg ARCH=$(ARCH) \
+	--build-arg http_proxy=$(http_proxy) \
+	--build-arg https_proxy=$(https_proxy) \
+	--target sdk \
+	. -t ${IMG}-sdk-$(ARCH):${IMG_TAG}
+
+.PHONY: docker-build-plugin-test
+docker-build-plugin-test: ## Build the out-of-tree plugin compatibility test image
+	$(CONTAINER_RUNTIME) build --platform=linux/$(ARCH) \
+	--build-arg ARCH=$(ARCH) \
+	--build-arg http_proxy=$(http_proxy) \
+	--build-arg https_proxy=$(https_proxy) \
+	-f Dockerfile.plugin-test \
+	. -t ${IMG}-plugin-test-$(ARCH):${IMG_TAG}
+
+.PHONY: docker-build-sdk-all
+docker-build-sdk-all: $(addprefix docker-build-sdk-,$(ALL_ARCH)) ## Build the SDK image for all architectures
+
+docker-build-sdk-%:
+	$(MAKE) ARCH=$* docker-build-sdk
 
 ## --------------------------------------
 ## Docker — All ARCH
@@ -383,7 +433,7 @@ kind-reset: ## Destroys the "bmo" kind cluster.
 ## Go module Targets
 ## --------------------------------------
 
-.PHONY:
+.PHONY: mod
 mod: ## Clean up go module settings
 	go mod tidy
 	go mod verify
@@ -415,12 +465,19 @@ $(RELEASE_NOTES_DIR):
 	mkdir -p $(RELEASE_NOTES_DIR)/
 
 .PHONY: release-notes
-release-notes: $(RELEASE_NOTES_DIR) $(RELEASE_NOTES)
-	cd hack/tools && $(GO) run release/notes.go  --releaseTag=$(RELEASE_TAG) > $(realpath $(RELEASE_NOTES_DIR))/$(RELEASE_TAG).md
+release-notes: $(RELEASE_NOTES_DIR) $(TOOLS_DIR)/go.mod ## Generates release notes for the given tag
+	@echo "Generating release notes for $(RELEASE_TAG)..."
+	@cd $(TOOLS_DIR) && $(GO) build -tags=tools -o $(BIN_DIR)/release ./release
+	@$(TOOLS_BIN_DIR)/release --releaseTag="$(RELEASE_TAG)" --githubToken="$${GITHUB_TOKEN}" > $(RELEASE_NOTES_DIR)/$(RELEASE_TAG).md
+	@echo "Release notes written to $(realpath $(RELEASE_NOTES_DIR))/$(RELEASE_TAG).md"
 
 .PHONY: release-manifests
 release-manifests: $(KUSTOMIZE) $(RELEASE_DIR) ## Builds the manifests to publish with a release
 	$(KUSTOMIZE) build config > $(RELEASE_DIR)/baremetal-operator.yaml
+
+.PHONY: release-vbmctl
+release-vbmctl: $(RELEASE_DIR) ## Build vbmctl for the release into out/
+	$(MAKE) build-vbmctl VBMCTL_OUT=$(abspath $(RELEASE_DIR))/vbmctl-$(shell go env GOOS)-$(shell go env GOARCH)
 
 .PHONY: release
 release:
@@ -430,6 +487,7 @@ release:
 	MANIFEST_IMG=$(IMG) MANIFEST_TAG=$(RELEASE_TAG) $(MAKE) set-manifest-image-bmo
 	PULL_POLICY=IfNotPresent $(MAKE) set-manifest-pull-policy
 	$(MAKE) release-manifests
+	$(MAKE) release-vbmctl BUILD_VERSION=${RELEASE_TAG}
 	$(MAKE) release-notes
 
 go-version: ## Print the go version we use to compile our binaries and images
@@ -444,6 +502,7 @@ clean: ## Remove all temporary files, directories and tools
 	rm -rf ironic-deployment/overlays/temp
 	rm -rf config/overlays/temp
 	rm -rf $(TOOLS_BIN_DIR)
+	rm -rf tools/bin
 
 .PHONY: clean-e2e
 clean-e2e: ## Remove everything related to e2e tests

@@ -9,14 +9,15 @@ set -eux
 IS_CONTAINER="${IS_CONTAINER:-false}"
 ARTIFACTS="${ARTIFACTS:-/tmp}"
 CONTAINER_RUNTIME="${CONTAINER_RUNTIME:-podman}"
-WORKDIR="${WORKDIR:-/workdir}"
 
 if [ "${IS_CONTAINER}" != "false" ]; then
-    # we need to tell git its OK to use dir owned by someone else
-    git config --global safe.directory "${WORKDIR}"
     export XDG_CACHE_HOME="/tmp/.cache"
 
-    INPUT_FILES="$(git ls-files config) $(git ls-files | grep zz_generated)"
+    mkdir /tmp/generate
+    cp -r . /tmp/generate
+    cd /tmp/generate
+
+    INPUT_FILES="$(find config -type f) $(find . -name 'zz_generated*' -type f)"
     cksum ${INPUT_FILES} > "${ARTIFACTS}/lint.cksums.before"
     export VERBOSE="--verbose"
     make generate manifests
@@ -30,9 +31,9 @@ else
         --env DEPLOY_KERNEL_URL=http://172.22.0.1/images/ironic-python-agent.kernel \
         --env DEPLOY_RAMDISK_URL=http://172.22.0.1/images/ironic-python-agent.initramfs \
         --env IRONIC_ENDPOINT=http://localhost:6385/v1/ \
-        --volume "${PWD}:${WORKDIR}:rw,z" \
+        --volume "${PWD}:/workdir:ro,z" \
         --entrypoint sh \
-        --workdir "${WORKDIR}" \
-        quay.io/metal3-io/basic-checks:golang-1.25 \
-        "${WORKDIR}"/hack/generate.sh "$@"
+        --workdir /workdir \
+        quay.io/metal3-io/basic-checks:golang-1.26 \
+        /workdir/hack/generate.sh "$@"
 fi

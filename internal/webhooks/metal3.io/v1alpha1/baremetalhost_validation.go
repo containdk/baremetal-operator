@@ -19,7 +19,6 @@ import (
 	"errors"
 	"fmt"
 	"net"
-	"net/url"
 	"regexp"
 	"slices"
 	"strings"
@@ -54,7 +53,7 @@ func (webhook *BareMetalHost) validateHost(host *metal3api.BareMetalHost) []erro
 
 	errs = append(errs, webhook.validateCrossNamespaceSecretReferences(host)...)
 
-	if raidErrors := validateRAID(host.Spec.RAID); raidErrors != nil {
+	if raidErrors := validateRAID(host); raidErrors != nil {
 		errs = append(errs, raidErrors...)
 	}
 
@@ -82,12 +81,18 @@ func (webhook *BareMetalHost) validateHost(host *metal3api.BareMetalHost) []erro
 		errs = append(errs, annotationErrors...)
 	}
 
-	if err := validateInspectionMode(host); err != nil {
+	if err := validateInspectionMode(host, bmcAccess); err != nil {
 		errs = append(errs, err)
 	}
 
 	if err := validatePowerStatus(host); err != nil {
 		errs = append(errs, err)
+	}
+
+	if len(host.Spec.NetworkInterfaces) > 0 {
+		if ifaceErrors := validateNetworkInterfaces(host.Spec.NetworkInterfaces); ifaceErrors != nil {
+			errs = append(errs, ifaceErrors...)
+		}
 	}
 
 	return errs
@@ -104,7 +109,9 @@ func (webhook *BareMetalHost) validateChanges(oldObj *metal3api.BareMetalHost, n
 
 	if oldObj.Spec.BMC.Address != "" &&
 		newObj.Spec.BMC.Address != oldObj.Spec.BMC.Address &&
+		oldObj.Status.OperationalStatus != metal3api.OperationalStatusDetached &&
 		newObj.Status.OperationalStatus != metal3api.OperationalStatusDetached &&
+		oldObj.Status.Provisioning.State != metal3api.StateRegistering &&
 		newObj.Status.Provisioning.State != metal3api.StateRegistering {
 		errs = append(errs, errors.New("BMC address can not be changed if the BMH is not in the Registering state, or if the BMH is not detached"))
 	}
@@ -113,17 +120,13 @@ func (webhook *BareMetalHost) validateChanges(oldObj *metal3api.BareMetalHost, n
 		errs = append(errs, errors.New("bootMACAddress can not be changed once it is set"))
 	}
 
-	// Disallow disabling externallyProvisioned.
-	if oldObj.Spec.ExternallyProvisioned && !newObj.Spec.ExternallyProvisioned {
-		errs = append(errs, errors.New("externallyProvisioned can not be changed from true to false"))
-	}
-
 	// Only allow enabling externallyProvisioned from Available state.
 	if !oldObj.Spec.ExternallyProvisioned && newObj.Spec.ExternallyProvisioned &&
+		oldObj.Status.Provisioning.State != metal3api.StateAvailable &&
 		newObj.Status.Provisioning.State != metal3api.StateAvailable {
 		errs = append(errs, fmt.Errorf(
 			"externallyProvisioned can only be enabled when in Available state, currently in %s",
-			newObj.Status.Provisioning.State))
+			oldObj.Status.Provisioning.State))
 	}
 
 	return errs
@@ -171,8 +174,9 @@ func validateBMCAccess(host *metal3api.BareMetalHost, bmcAccess bmc.AccessDetail
 	return errs
 }
 
-func validateRAID(r *metal3api.RAIDConfig) []error {
+func validateRAID(host *metal3api.BareMetalHost) []error {
 	var errs []error
+	r := host.Spec.RAID
 
 	if r == nil {
 		return nil
@@ -195,6 +199,24 @@ func validateRAID(r *metal3api.RAIDConfig) []error {
 			if *volume.NumberOfPhysicalDisks != len(volume.PhysicalDisks) {
 				errs = append(errs, fmt.Errorf("the 'numberOfPhysicalDisks'[%d] and number of 'physicalDisks'[%d] is not same for volume %d", *volume.NumberOfPhysicalDisks, len(volume.PhysicalDisks), index))
 			}
+		}
+	}
+
+	// check rootVolume only set for one of the software raid volumes
+	rootCount := r.GetRootVolumeCount()
+	if rootCount > 1 {
+		errs = append(errs, errors.New("softwareRAIDVolumes[*].rootVolume can only be set once"))
+	}
+	if rootCount == 1 && host.Spec.RootDeviceHints != nil {
+		errs = append(errs, errors.New("softwareRAIDVolumes[*].rootVolume and rootDeviceHints can not be set at the same time"))
+	}
+
+	// enforce RAID-1 for any volume designated as root, matching the policy in
+	// the API types: the deployment device must be RAID-1 to avoid a non-booting
+	// host on disk failure.
+	for index, volume := range r.SoftwareRAIDVolumes {
+		if volume.RootVolume && volume.Level != "1" {
+			errs = append(errs, fmt.Errorf("softwareRAIDVolumes[%d] with rootVolume set must use RAID level 1", index))
 		}
 	}
 
@@ -270,7 +292,7 @@ func validateStatusAnnotation(statusAnnotation string) error {
 func validateImage(image *metal3api.Image) []error {
 	var errs []error
 
-	_, err := url.ParseRequestURI(image.URL)
+	err := validateURL(image.URL)
 	if err != nil {
 		errs = append(errs, fmt.Errorf("image URL %s is invalid: %w", image.URL, err))
 	}
@@ -398,7 +420,7 @@ func (webhook *BareMetalHost) validateCrossNamespaceSecretReferences(host *metal
 	return errs
 }
 
-func validateInspectionMode(host *metal3api.BareMetalHost) error {
+func validateInspectionMode(host *metal3api.BareMetalHost, bmcAccess bmc.AccessDetails) error {
 	inspectAnnotation := host.Annotations[metal3api.InspectAnnotationPrefix]
 
 	// Check for contradicting values when both are set
@@ -416,8 +438,13 @@ func validateInspectionMode(host *metal3api.BareMetalHost) error {
 	// but we validate here for safety)
 	if host.Spec.InspectionMode != "" &&
 		host.Spec.InspectionMode != metal3api.InspectionModeDisabled &&
-		host.Spec.InspectionMode != metal3api.InspectionModeAgent {
-		return fmt.Errorf("invalid inspectionMode value: %s, allowed values are 'disabled' or 'agent'", host.Spec.InspectionMode)
+		host.Spec.InspectionMode != metal3api.InspectionModeAgent &&
+		host.Spec.InspectionMode != metal3api.InspectionModeFast {
+		return fmt.Errorf("invalid inspectionMode value: %s, allowed values are 'disabled', 'agent', or 'fast'", host.Spec.InspectionMode)
+	}
+
+	if host.Spec.InspectionMode == metal3api.InspectionModeFast && bmcAccess != nil && bmcAccess.InspectInterface() == "" {
+		return fmt.Errorf("BMC driver %s does not support fast (out-of-band) inspection", bmcAccess.Type())
 	}
 
 	return nil
@@ -428,4 +455,32 @@ func validatePowerStatus(host *metal3api.BareMetalHost) error {
 		return errors.New("node can't simultaneously have online set to false and have power off disabled")
 	}
 	return nil
+}
+
+// validateNetworkInterfaces validates NetworkInterface specifications.
+func validateNetworkInterfaces(networkInterfaces []metal3api.NetworkInterface) []error {
+	var errs []error
+	seen := make(map[string]bool, len(networkInterfaces))
+
+	for i, iface := range networkInterfaces {
+		// At least one identifier (Name or MACAddress) must be specified
+		if !iface.IsValid() {
+			errs = append(errs, fmt.Errorf("networkInterfaces[%d]: must specify either name or macAddress", i))
+			continue
+		}
+
+		// Name and MACAddress are mutually exclusive
+		if iface.Name != "" && iface.MACAddress != "" {
+			errs = append(errs, fmt.Errorf("networkInterfaces[%d]: name and macAddress are mutually exclusive", i))
+			continue
+		}
+
+		key := strings.ToLower(iface.GetKey())
+		if seen[key] {
+			errs = append(errs, fmt.Errorf("networkInterfaces[%d]: duplicate interface selector for %q", i, iface.GetKey()))
+		}
+		seen[key] = true
+	}
+
+	return errs
 }

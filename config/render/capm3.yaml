@@ -291,6 +291,13 @@ spec:
                     - vmdk
                     - live-iso
                     type: string
+                  ociAuthSecretName:
+                    description: |-
+                      OCIAuthSecretName optionally names a Docker-config secret containing
+                      registry credentials for oci:// images. Must be in the same namespace
+                      as the BareMetalHost. Allowed types: kubernetes.io/dockerconfigjson|dockercfg.
+                      Only used when Image.URL has the oci:// scheme.
+                    type: string
                   url:
                     description: URL is a location of an image to deploy.
                     type: string
@@ -302,9 +309,11 @@ spec:
                   Specifies the mode for host inspection.
                   "disabled" - no inspection will be performed
                   "agent" - normal agent-based inspection will run
+                  "fast" - out-of-band inspection via BMC (Redfish), no ramdisk boot
                 enum:
                 - disabled
                 - agent
+                - fast
                 type: string
               metaData:
                 description: |-
@@ -338,6 +347,72 @@ spec:
                     type: string
                 type: object
                 x-kubernetes-map-type: atomic
+              networkInterfaces:
+                description: |-
+                  NetworkInterfaces defines the network configuration for each interface.
+                  This will be used to configure switch ports for the host.  Interface
+                  names must correspond to actual NICs discovered during inspection
+                  (see HardwareData resource).  They are referenced by either the name
+                  or MAC address of the NIC.
+                items:
+                  description: NetworkInterface defines the network configuration
+                    for a specific interface.
+                  properties:
+                    hostNetworkAttachment:
+                      description: HostNetworkAttachment references the HostNetworkAttachment
+                        for this interface
+                      properties:
+                        name:
+                          description: Name of the HostNetworkAttachment resource
+                          maxLength: 253
+                          type: string
+                        namespace:
+                          description: Namespace of the HostNetworkAttachment (defaults
+                            to BMH namespace)
+                          maxLength: 63
+                          type: string
+                      type: object
+                    macAddress:
+                      description: |-
+                        MAC address of the network interface.  This must match the MAC address
+                        of a NIC discovered during inspection (see HardwareData resource).
+                        Mutually exclusive with Name.
+                      pattern: ^[0-9a-fA-F]{2}(:[0-9a-fA-F]{2}){5}$
+                      type: string
+                    name:
+                      description: |-
+                        Name of the network interface (e.g., "eth0", "ens1f0")
+                        This must match the name of a NIC discovered during inspection
+                        (see HardwareData resource).
+                        Mutually exclusive with MACAddress.
+                      pattern: ^[a-zA-Z0-9._-]+$
+                      type: string
+                    switchPort:
+                      description: |-
+                        SwitchPort defines the switch port on which this interface is attached.
+                        This is intended to be a replacement for LLDP information if
+                        LLDP is not enabled on the neighboring switches or if inspection is not
+                        used on the BMH.  If LLDP information is acquired during inspection and
+                        this field is provided then it will override the LLDP provided
+                        information; therefore, caution must be exercised when supplying this
+                        value.
+                      properties:
+                        portID:
+                          description: |-
+                            PortID is expected to be the configuration name of the port in the
+                            switch management system.
+                          type: string
+                        switchID:
+                          description: SwitchID is expected to be the management MAC
+                            address of the switch
+                          pattern: ^[0-9a-fA-F]{2}(:[0-9a-fA-F]{2}){5}$
+                          type: string
+                      required:
+                      - portID
+                      - switchID
+                      type: object
+                  type: object
+                type: array
               online:
                 description: |-
                   Should the host be powered on? If the host is currently in a stable
@@ -504,6 +579,12 @@ spec:
                             type: object
                           minItems: 2
                           type: array
+                        rootVolume:
+                          default: false
+                          description: |-
+                            Setting this to true, causes installer to consider this volume as root device for installation.
+                            This can only be set for one of the volumes.
+                          type: boolean
                         sizeGibibytes:
                           description: |-
                             Size of the logical disk to be created in GiB.
@@ -576,8 +657,9 @@ spec:
               taints:
                 description: |-
                   Taints is the full, authoritative list of taints to apply to
-                  the corresponding Machine. This list will overwrite any
-                  modifications made to the Machine on an ongoing basis.
+                  the corresponding Machine.
+
+                  Deprecated: the Taints field was never actually implemented.
                 items:
                   description: |-
                     The node this Taint is attached to has the "effect" on
@@ -923,6 +1005,53 @@ spec:
                   The name of the profile matching the hardware details.
                   Hardware profiles are deprecated and should not be relied on.
                 type: string
+              lastAttemptedImage:
+                description: |-
+                  LastAttemptedImage stores the full image spec of the last provisioning
+                  attempt, used to detect user-initiated image changes (URL, checksum,
+                  format, etc.) that should reset the provisioning retry limit counter.
+                properties:
+                  checksum:
+                    description: |-
+                      Checksum is the checksum for the image. Required for all formats
+                      except for "live-iso" and OCI images (oci://).
+                    type: string
+                  checksumType:
+                    description: |-
+                      ChecksumType is the checksum algorithm for the image, e.g md5, sha256 or sha512.
+                      The special value "auto" can be used to detect the algorithm from the checksum.
+                      If missing, MD5 is used. If in doubt, use "auto".
+                    enum:
+                    - md5
+                    - sha256
+                    - sha512
+                    - auto
+                    type: string
+                  format:
+                    description: |-
+                      Format contains the format of the image (raw, qcow2, ...).
+                      When set to "live-iso", an ISO 9660 image referenced by the url will
+                      be live-booted and not deployed to disk.
+                    enum:
+                    - raw
+                    - qcow2
+                    - vdi
+                    - vmdk
+                    - live-iso
+                    type: string
+                  ociAuthSecretName:
+                    description: |-
+                      OCIAuthSecretName optionally names a Docker-config secret containing
+                      registry credentials for oci:// images. Must be in the same namespace
+                      as the BareMetalHost. Allowed types: kubernetes.io/dockerconfigjson|dockercfg.
+                      Only used when Image.URL has the oci:// scheme.
+                    type: string
+                  url:
+                    description: URL is a location of an image to deploy.
+                    type: string
+                required:
+                - url
+                type: object
               lastUpdated:
                 description: LastUpdated identifies when this status was last observed.
                 format: date-time
@@ -1092,6 +1221,13 @@ spec:
                         - vmdk
                         - live-iso
                         type: string
+                      ociAuthSecretName:
+                        description: |-
+                          OCIAuthSecretName optionally names a Docker-config secret containing
+                          registry credentials for oci:// images. Must be in the same namespace
+                          as the BareMetalHost. Allowed types: kubernetes.io/dockerconfigjson|dockercfg.
+                          Only used when Image.URL has the oci:// scheme.
+                        type: string
                       url:
                         description: URL is a location of an image to deploy.
                         type: string
@@ -1247,6 +1383,12 @@ spec:
                                 type: object
                               minItems: 2
                               type: array
+                            rootVolume:
+                              default: false
+                              description: |-
+                                Setting this to true, causes installer to consider this volume as root device for installation.
+                                This can only be set for one of the volumes.
+                              type: boolean
                             sizeGibibytes:
                               description: |-
                                 Size of the logical disk to be created in GiB.
@@ -1321,6 +1463,14 @@ spec:
                 - ID
                 - state
                 type: object
+              provisioningFailCount:
+                default: 0
+                description: |-
+                  ProvisioningFailCount records how many times provisioning has failed
+                  consecutively for the current image. Unlike ErrorCount, it is not reset
+                  on deprovisioning and is only cleared on successful provisioning or when
+                  a new image is specified.
+                type: integer
               triedCredentials:
                 description: The last credentials we sent to the provisioning backend.
                 properties:
@@ -1348,6 +1498,198 @@ spec:
             - operationalStatus
             - poweredOn
             - provisioning
+            - provisioningFailCount
+            type: object
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.16.5
+  name: baremetalswitches.metal3.io
+spec:
+  group: metal3.io
+  names:
+    kind: BareMetalSwitch
+    listKind: BareMetalSwitchList
+    plural: baremetalswitches
+    shortNames:
+    - bms
+    singular: baremetalswitch
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - description: Switch driver type
+      jsonPath: .spec.driver
+      name: Driver
+      type: string
+    - description: Switch device type
+      jsonPath: .spec.deviceType
+      name: Device Type
+      type: string
+    - description: Switch address
+      jsonPath: .spec.address
+      name: Address
+      type: string
+    - description: Valid
+      jsonPath: .status.conditions[?(@.type=="Valid")].status
+      name: Valid
+      type: string
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: BareMetalSwitch represents a Top-of-Rack switch managed by Ironic
+          Networking.
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: BareMetalSwitchSpec defines the desired state of BareMetalSwitch.
+            properties:
+              address:
+                description: Address is the network address of the switch (IP address
+                  or hostname).
+                type: string
+              credentials:
+                description: |-
+                  The secret containing the switch credentials (requires key "username"
+                  and either "password" or "ssh-privatekey"). An optional "admin-password"
+                  key can be provided for privilege escalation.
+                properties:
+                  name:
+                    description: name is unique within a namespace to reference a
+                      secret resource.
+                    type: string
+                  namespace:
+                    description: namespace defines the space within which the secret
+                      name must be unique.
+                    type: string
+                type: object
+                x-kubernetes-map-type: atomic
+              deviceType:
+                description: |-
+                  DeviceType specifies the device type for the generic-switch driver.
+                  Must be one of the device types supported by networking-generic-switch.
+                  Examples: netmiko_cisco_ios, netmiko_dell_force10, netmiko_dell_os10,
+                    netmiko_juniper_junos, netmiko_arista_eos
+                  See https://docs.openstack.org/networking-generic-switch/latest/configuration.html
+                type: string
+              disableCertificateVerification:
+                description: |-
+                  DisableCertificateVerification disables TLS certificate verification when using
+                  HTTPS to connect to the switch. This is required for self-signed certificates,
+                  but is insecure as it allows man-in-the-middle attacks.
+                type: boolean
+              driver:
+                default: generic-switch
+                description: Driver specifies the driver to use. Currently only "generic-switch"
+                  is supported.
+                enum:
+                - generic-switch
+                type: string
+              macAddress:
+                description: |-
+                  MACAddress is the MAC address of the switch management interface.
+                  Used to correlate LLDP information from nodes to identify which switch they're connected to.
+                pattern: ^[0-9a-fA-F]{2}(:[0-9a-fA-F]{2}){5}$
+                type: string
+              port:
+                description: |-
+                  Port specifies the management port to connect to (e.g., SSH port 22, HTTPS port 443).
+                  If not specified, the driver will use its default port based on the device type.
+                format: int32
+                maximum: 65535
+                minimum: 1
+                type: integer
+            required:
+            - address
+            - deviceType
+            - macAddress
+            type: object
+          status:
+            description: BareMetalSwitchStatus defines the observed state of BareMetalSwitch.
+            properties:
+              conditions:
+                description: Conditions describes the state of the BareMetalSwitch
+                  resource.
+                items:
+                  description: Condition contains details for one aspect of the current
+                    state of this API Resource.
+                  properties:
+                    lastTransitionTime:
+                      description: |-
+                        lastTransitionTime is the last time the condition transitioned from one status to another.
+                        This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                      format: date-time
+                      type: string
+                    message:
+                      description: |-
+                        message is a human readable message indicating details about the transition.
+                        This may be an empty string.
+                      maxLength: 32768
+                      type: string
+                    observedGeneration:
+                      description: |-
+                        observedGeneration represents the .metadata.generation that the condition was set based upon.
+                        For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
+                        with respect to the current state of the instance.
+                      format: int64
+                      minimum: 0
+                      type: integer
+                    reason:
+                      description: |-
+                        reason contains a programmatic identifier indicating the reason for the condition's last transition.
+                        Producers of specific condition types may define expected values and meanings for this field,
+                        and whether the values are considered a guaranteed API.
+                        The value should be a CamelCase string.
+                        This field may not be empty.
+                      maxLength: 1024
+                      minLength: 1
+                      pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                      type: string
+                    status:
+                      description: status of the condition, one of True, False, Unknown.
+                      enum:
+                      - "True"
+                      - "False"
+                      - Unknown
+                      type: string
+                    type:
+                      description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                      maxLength: 316
+                      pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
+                x-kubernetes-list-map-keys:
+                - type
+                x-kubernetes-list-type: map
             type: object
         type: object
     served: true
@@ -2041,6 +2383,13 @@ spec:
                     - vmdk
                     - live-iso
                     type: string
+                  ociAuthSecretName:
+                    description: |-
+                      OCIAuthSecretName optionally names a Docker-config secret containing
+                      registry credentials for oci:// images. Must be in the same namespace
+                      as the BareMetalHost. Allowed types: kubernetes.io/dockerconfigjson|dockercfg.
+                      Only used when Image.URL has the oci:// scheme.
+                    type: string
                   url:
                     description: URL is a location of an image to deploy.
                     type: string
@@ -2625,6 +2974,103 @@ kind: CustomResourceDefinition
 metadata:
   annotations:
     controller-gen.kubebuilder.io/version: v0.16.5
+  name: hostnetworkattachments.metal3.io
+spec:
+  group: metal3.io
+  names:
+    kind: HostNetworkAttachment
+    listKind: HostNetworkAttachmentList
+    plural: hostnetworkattachments
+    singular: hostnetworkattachment
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - description: Switchport mode
+      jsonPath: .spec.mode
+      name: Mode
+      type: string
+    - description: Native VLAN ID
+      jsonPath: .spec.nativeVLAN
+      name: Native VLAN
+      type: integer
+    - description: Time duration since creation
+      jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: |-
+          HostNetworkAttachment defines switchport configuration for BMH network interfaces.
+          Spec fields are mutable when no BMH references the attachment, immutable when in use.
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: HostNetworkAttachmentSpec defines the desired switchport
+              configuration.
+            properties:
+              allowedVLANs:
+                description: |-
+                  AllowedVLANs specifies the VLAN IDs allowed on this network attachment.
+                  Each entry is either a single VLAN ID (e.g., "100") or a range (e.g., "100-200").
+                  This is typically used in trunk or hybrid mode to specify which tagged VLANs can be carried on the interface.
+                items:
+                  pattern: ^\d+(-\d+)?$
+                  type: string
+                type: array
+              mode:
+                default: access
+                description: Mode specifies the network attachment mode.
+                enum:
+                - access
+                - trunk
+                - hybrid
+                type: string
+              mtu:
+                description: |-
+                  MTU specifies the Maximum Transmission Unit size for the network attachment.
+                  If not specified, the default MTU for the underlying network will be used.
+                maximum: 9216
+                minimum: 68
+                type: integer
+              nativeVLAN:
+                description: |-
+                  NativeVLAN specifies the native VLAN ID for the network attachment.
+                  This is the untagged VLAN used on the interface.
+                maximum: 4094
+                minimum: 1
+                type: integer
+            required:
+            - mode
+            - nativeVLAN
+            type: object
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.16.5
   name: hostupdatepolicies.metal3.io
 spec:
   group: metal3.io
@@ -2928,11 +3374,14 @@ rules:
   - namespaces
   verbs:
   - get
+  - list
+  - watch
 - apiGroups:
   - ""
   resources:
   - secrets
   verbs:
+  - delete
   - get
   - list
   - update
@@ -2979,6 +3428,7 @@ rules:
   - metal3.io
   resources:
   - baremetalhosts/status
+  - baremetalswitches/status
   - bmceventsubscriptions/status
   - dataimages/status
   - firmwareschemas/status
@@ -2993,6 +3443,7 @@ rules:
 - apiGroups:
   - metal3.io
   resources:
+  - baremetalswitches
   - hostdeploypolicies
   verbs:
   - get
@@ -3003,6 +3454,7 @@ rules:
   resources:
   - hostupdatepolicies
   verbs:
+  - delete
   - get
   - list
   - update
@@ -3139,6 +3591,7 @@ spec:
       containers:
       - args:
         - --enable-leader-election
+        - --hostclaims
         command:
         - /baremetal-operator
         env:
@@ -3236,7 +3689,6 @@ metadata:
 webhooks:
 - admissionReviewVersions:
   - v1
-  - v1beta
   clientConfig:
     service:
       name: baremetal-operator-webhook-service
@@ -3257,7 +3709,6 @@ webhooks:
   sideEffects: None
 - admissionReviewVersions:
   - v1
-  - v1beta
   clientConfig:
     service:
       name: baremetal-operator-webhook-service
@@ -3275,4 +3726,85 @@ webhooks:
     - UPDATE
     resources:
     - bmceventsubscriptions
+  sideEffects: None
+- admissionReviewVersions:
+  - v1
+  clientConfig:
+    service:
+      name: baremetal-operator-webhook-service
+      namespace: baremetal-operator-system
+      path: /validate-metal3-io-v1alpha1-dataimage
+  failurePolicy: Fail
+  name: dataimage.metal3.io
+  rules:
+  - apiGroups:
+    - metal3.io
+    apiVersions:
+    - v1alpha1
+    operations:
+    - CREATE
+    - UPDATE
+    resources:
+    - dataimages
+  sideEffects: None
+- admissionReviewVersions:
+  - v1
+  clientConfig:
+    service:
+      name: baremetal-operator-webhook-service
+      namespace: baremetal-operator-system
+      path: /validate-metal3-io-v1alpha1-hostclaim
+  failurePolicy: Fail
+  name: hostclaim.metal3.io
+  rules:
+  - apiGroups:
+    - metal3.io
+    apiVersions:
+    - v1alpha1
+    operations:
+    - CREATE
+    - UPDATE
+    resources:
+    - hostclaims
+  sideEffects: None
+- admissionReviewVersions:
+  - v1
+  clientConfig:
+    service:
+      name: baremetal-operator-webhook-service
+      namespace: baremetal-operator-system
+      path: /validate-metal3-io-v1alpha1-hostfirmwarecomponents
+  failurePolicy: Fail
+  name: hostfirmwarecomponents.metal3.io
+  rules:
+  - apiGroups:
+    - metal3.io
+    apiVersions:
+    - v1alpha1
+    operations:
+    - CREATE
+    - UPDATE
+    resources:
+    - hostfirmwarecomponents
+  sideEffects: None
+- admissionReviewVersions:
+  - v1
+  clientConfig:
+    service:
+      name: baremetal-operator-webhook-service
+      namespace: baremetal-operator-system
+      path: /validate-metal3-io-v1alpha1-hostnetworkattachment
+  failurePolicy: Fail
+  name: hostnetworkattachment.metal3.io
+  rules:
+  - apiGroups:
+    - metal3.io
+    apiVersions:
+    - v1alpha1
+    operations:
+    - CREATE
+    - UPDATE
+    - DELETE
+    resources:
+    - hostnetworkattachments
   sideEffects: None

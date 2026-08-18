@@ -1,34 +1,53 @@
 # Support FROM override
-ARG BUILD_IMAGE=docker.io/golang:1.25.9@sha256:5ab234a9519e05043f4a97a505a59f21dc40eee172d6b17d411863d6bba599bb
-ARG BASE_IMAGE=gcr.io/distroless/static:nonroot@sha256:9ecc53c269509f63c69a266168e4a687c7eb8c0cfd753bd8bfcaa4f58a90876f
+ARG BUILD_IMAGE=docker.io/golang:1.26.5@sha256:3aff6657219a4d9c14e27fb1d8976c49c29fddb70ba835014f477e1c70636647
+ARG BASE_IMAGE=gcr.io/distroless/base-debian13:nonroot@sha256:a557d784ac275c287d2bdf3172f47bece8d2a0ef3c0fdefb712e95084a04a562
 
-# Build the manager binary
-FROM --platform=$BUILDPLATFORM $BUILD_IMAGE AS builder
-
-ARG TARGETOS
-ARG TARGETARCH
+# Shared SDK stage: pinned Go toolchain, modules, and checked-out tree.
+# Downstream builder stages copy from here so we pay the `go mod download`
+# cost once. Third parties can also build custom provisioner plugins against
+# this image to guarantee toolchain and module-version parity with BMO.
+FROM $BUILD_IMAGE AS sdk
 
 WORKDIR /workspace
 
-# Bring in the go dependencies before anything else so we can take
-# advantage of caching these layers in future builds.
 COPY go.mod go.sum ./
 COPY apis/go.mod apis/go.sum apis/
 COPY hack/tools/go.mod hack/tools/go.sum hack/tools/
 COPY pkg/hardwareutils/go.mod pkg/hardwareutils/go.sum pkg/hardwareutils/
 RUN go mod download
 
+COPY . .
+
+ENV CGO_ENABLED=1
+ENV GO111MODULE=on
+
+# Build the manager binary
+FROM sdk AS builder
+ARG ARCH=amd64
 ARG SOURCE_GIT_COMMIT
 ARG BUILD_VERSION
-ARG LDFLAGS="-s -w -extldflags=-static" 
+ARG LDFLAGS=-s -w
 ENV VERSION_URI="github.com/metal3-io/baremetal-operator/pkg/version"
+RUN GOOS=linux GOARCH=${ARCH} \
+    go build -a -ldflags "${LDFLAGS} -X ${VERSION_URI}.Raw=${BUILD_VERSION} -X ${VERSION_URI}.Commit=${SOURCE_GIT_COMMIT} -X ${VERSION_URI}.BuildTime=$(date '+%Y-%m-%dT%H:%M:%S%z')" -o baremetal-operator main.go
 
-COPY . .
-RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} GO111MODULE=on go build -a -ldflags "${LDFLAGS} -X ${VERSION_URI}.Raw=${BUILD_VERSION} -X ${VERSION_URI}.Commit=${SOURCE_GIT_COMMIT} -X ${VERSION_URI}.BuildTime=$(date '+%Y-%m-%dT%H:%M:%S%z')" -o baremetal-operator main.go
+# Build the ironic provisioner plugin
+FROM sdk AS ironic-plugin-builder
+ARG ARCH=amd64
+ARG LDFLAGS=-s -w
+RUN GOOS=linux GOARCH=${ARCH} \
+    go build -buildmode=plugin -ldflags "${LDFLAGS}" \
+    -o ironic-provisioner.so ./pkg/provisioner/ironic/plugin/
 
-# Copy the controller-manager into a thin image
-# BMO has a dependency preventing us to use the static one,
-# using the base one instead
+# Build the demo provisioner plugin
+FROM sdk AS demo-plugin-builder
+ARG ARCH=amd64
+ARG LDFLAGS=-s -w
+RUN GOOS=linux GOARCH=${ARCH} \
+    go build -buildmode=plugin -ldflags "${LDFLAGS}" \
+    -o demo-provisioner.so ./pkg/provisioner/demo/plugin/
+
+# Runtime image. Uses distroless/base (not static) because Go plugins need glibc.
 FROM $BASE_IMAGE
 
 # image.version is set during image build by automation
@@ -42,5 +61,7 @@ LABEL org.opencontainers.image.vendor="Metal3-io"
 
 WORKDIR /
 COPY --from=builder /workspace/baremetal-operator .
+COPY --from=ironic-plugin-builder /workspace/ironic-provisioner.so /plugins/ironic-provisioner.so
+COPY --from=demo-plugin-builder /workspace/demo-provisioner.so /plugins/demo-provisioner.so
 USER nonroot:nonroot
 ENTRYPOINT ["/baremetal-operator"]

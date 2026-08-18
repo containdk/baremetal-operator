@@ -16,6 +16,10 @@ import (
 Package provisioning defines the API for talking to the provisioning backend.
 */
 
+// ErrNotReady is returned by NewProvisioner when the provisioning backend
+// is not yet available. Controllers should requeue and retry.
+var ErrNotReady = errors.New("provisioner is not ready")
+
 // EventPublisher is a function type for publishing events associated
 // with provisioning.
 type EventPublisher func(reason, message string)
@@ -84,6 +88,9 @@ type ManagementAccessData struct {
 	HasCustomDeploy            bool
 	DisablePowerOff            bool
 	CPUArchitecture            string
+	HardwareData               *metal3api.HardwareData
+	DisableInspection          bool
+	InspectionMode             metal3api.InspectionMode
 }
 
 type AdoptData struct {
@@ -93,6 +100,7 @@ type AdoptData struct {
 type InspectData struct {
 	BootMode        metal3api.BootMode
 	CPUArchitecture string
+	InspectionMode  metal3api.InspectionMode
 }
 
 // FirmwareConfig and FirmwareSettings are used for implementation of similar functionality
@@ -128,6 +136,7 @@ type ProvisionData struct {
 	HardwareProfile profile.Profile
 	RootDeviceHints *metal3api.RootDeviceHints
 	CustomDeploy    *metal3api.CustomDeploy
+	ImagePullSecret string
 }
 
 type HTTPHeaders []map[string]string
@@ -147,7 +156,7 @@ type Provisioner interface {
 	// PreprovisioningImageFormats returns a list of acceptable formats for a
 	// pre-provisioning image to be built by a PreprovisioningImage object. The
 	// list should be nil if no image build is requested.
-	PreprovisioningImageFormats() ([]metal3api.ImageFormat, error)
+	PreprovisioningImageFormats(ctx context.Context) ([]metal3api.ImageFormat, error)
 
 	// InspectHardware updates the HardwareDetails field of the host with
 	// details of devices discovered on the hardware. It may be called
@@ -189,11 +198,13 @@ type Provisioner interface {
 	Delete(ctx context.Context) (result Result, err error)
 
 	// Detach removes the host from the provisioning system.
-	// Similar to Delete, but ensures non-interruptive behavior
-	// for the target system.  It may be called multiple times,
-	// and should return true for its dirty  flag until the
-	// deletion operation is completed.
-	Detach(ctx context.Context) (result Result, err error)
+	// With force set to false, it ensures non-interruptive behavior
+	// for the target system. When force is set to true, provisioning
+	// processes may be interrupted to speed up the removal. Otherwise,
+	// the provisioner must wait for a stable state before the removal.
+	// This method may be called multiple times, and should return true
+	// for its dirty flag until the detachment operation is completed.
+	Detach(ctx context.Context, force bool) (result Result, err error)
 
 	// PowerOn ensures the server is powered on independently of any image
 	// provisioning operation.
@@ -205,10 +216,6 @@ type Provisioner interface {
 	// The automatedCleaningMode indicates the user's current intent regarding
 	// automated cleaning, used to determine if cleaning should be aborted during deletion.
 	PowerOff(ctx context.Context, rebootMode metal3api.RebootMode, force bool, automatedCleaningMode metal3api.AutomatedCleaningMode) (result Result, err error)
-
-	// TryInit checks if the provisioning backend is available to accept
-	// all the incoming requests and configures the available features.
-	TryInit(ctx context.Context) (ready bool, err error)
 
 	// HasCapacity checks if the backend has a free (de)provisioning slot for the current host
 	HasCapacity(ctx context.Context) (result bool, err error)
@@ -274,9 +281,6 @@ var ErrNeedsRegistration = errors.New("host not registered")
 // ErrNeedsPreprovisioningImage is returned if a preprovisioning image is
 // required.
 var ErrNeedsPreprovisioningImage = errors.New("no suitable Preprovisioning image available")
-
-// ErrFirmwareUpdateUnsupported is returned if the host can't execute firmware updates.
-var ErrFirmwareUpdateUnsupported = errors.New("host does not support Firmware Updates")
 
 // ErrNodeIsBusy is returned when the node is busy due to being reserved for another
 // task.

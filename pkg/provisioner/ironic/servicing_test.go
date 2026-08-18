@@ -31,6 +31,7 @@ func (r *BIOSTestBMC) ManagementInterface() string                   { return ""
 func (r *BIOSTestBMC) PowerInterface() string                        { return "" }
 func (r *BIOSTestBMC) RAIDInterface() string                         { return "" }
 func (r *BIOSTestBMC) VendorInterface() string                       { return "" }
+func (r *BIOSTestBMC) InspectInterface() string                      { return "" }
 func (r *BIOSTestBMC) SupportsSecureBoot() bool                      { return false }
 func (r *BIOSTestBMC) RequiresProvisioningNetwork() bool             { return true }
 func (r *BIOSTestBMC) BuildBIOSSettings(_ *bmc.FirmwareConfig) ([]map[string]string, error) {
@@ -73,7 +74,7 @@ func TestService(t *testing.T) {
 			}),
 			unprepared:           true,
 			expectedStarted:      true,
-			expectedRequestAfter: 10,
+			expectedRequestAfter: 3,
 			expectedDirty:        true,
 		},
 		{
@@ -94,7 +95,7 @@ func TestService(t *testing.T) {
 			}),
 			skipConfig:           true,
 			expectedStarted:      true,
-			expectedRequestAfter: 10,
+			expectedRequestAfter: 3,
 			expectedDirty:        true,
 		},
 		{
@@ -105,7 +106,7 @@ func TestService(t *testing.T) {
 			}),
 			unprepared:           true,
 			expectedStarted:      true,
-			expectedRequestAfter: 10,
+			expectedRequestAfter: 3,
 			expectedDirty:        true,
 		},
 		{
@@ -149,7 +150,7 @@ func TestService(t *testing.T) {
 			}),
 			skipConfig:           true,
 			expectedStarted:      true,
-			expectedRequestAfter: 10,
+			expectedRequestAfter: 3,
 			expectedDirty:        true,
 		},
 		{

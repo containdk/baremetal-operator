@@ -7,10 +7,10 @@ resources:
 
 patches:
 - patch: |
-    # Enable test mode (fixture provider instead of ironic)
+    # Use the fixture provisioner (compiled into the manager) instead of ironic
     - op: add
       path: /spec/template/spec/containers/0/args/-
-      value: --test-mode
+      value: --provisioner=fixture
     # Don't try to pull again the pre-loaded image
     - op: replace
       path: /spec/template/spec/containers/0/imagePullPolicy
@@ -18,6 +18,18 @@ patches:
   target:
     kind: Deployment
     name: controller-manager
+
+generatorOptions:
+  disableNameSuffixHash: true
+
+configMapGenerator:
+- name: ironic
+  behavior: merge
+  literals:
+  - IRONIC_NETWORKING_ENABLED=true
+  - IRONIC_SWITCH_CONFIGS_SECRET=metal3-switch-configs
+  - IRONIC_SWITCH_CREDENTIALS_SECRET=metal3-switch-credentials
+  - IRONIC_SWITCH_CREDENTIALS_PATH=/etc/ironic/switch-credentials
 
 images:
 - name: quay.io/metal3-io/baremetal-operator

@@ -8,25 +8,29 @@ import (
 	"fmt"
 	"path"
 
+	ironicPort "github.com/gophercloud/gophercloud/v2/openstack/baremetal/v1/ports"
 	metal3api "github.com/metal3-io/baremetal-operator/apis/metal3.io/v1alpha1"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/utils/ptr"
 	"sigs.k8s.io/cluster-api/test/framework"
 	"sigs.k8s.io/cluster-api/util"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
-var _ = Describe("Inspection", Label("required", "inspection"), func() {
+var _ = Describe("Inspection", Label("required", "inspection", "ironic"), func() {
 	var (
 		specName      = "inspection"
-		secretName    = "bmc-credentials"
 		namespace     *corev1.Namespace
 		cancelWatches context.CancelFunc
+		toCleanup     []client.Object
+		forceTrue     = ptr.To("{\"force\": true}")
 	)
 	BeforeEach(func() {
-
+		toCleanup = nil
 		isNamespaced := e2eConfig.GetBoolVariable("NAMESPACE_SCOPED")
 
 		namespaceInput := framework.CreateNamespaceAndWatchEventsInput{
@@ -55,6 +59,7 @@ var _ = Describe("Inspection", Label("required", "inspection"), func() {
 		}
 		err := clusterProxy.GetClient().Create(ctx, &bmh)
 		Expect(err).NotTo(HaveOccurred())
+		toCleanup = append(toCleanup, &bmh)
 
 		By("waiting for the BMH to be in unmanaged state")
 		WaitForBmhInProvisioningState(ctx, WaitForBmhInProvisioningStateInput{
@@ -63,16 +68,6 @@ var _ = Describe("Inspection", Label("required", "inspection"), func() {
 			State:  metal3api.StateUnmanaged,
 		}, e2eConfig.GetIntervals(specName, "wait-unmanaged")...)
 
-		By("Delete BMH")
-		err = clusterProxy.GetClient().Delete(ctx, &bmh)
-		Expect(err).NotTo(HaveOccurred())
-
-		By("Waiting for the BMH to be deleted")
-		WaitForBmhDeleted(ctx, WaitForBmhDeletedInput{
-			Client:    clusterProxy.GetClient(),
-			BmhName:   bmh.Name,
-			Namespace: bmh.Namespace,
-		}, e2eConfig.GetIntervals(specName, "wait-bmh-deleted")...)
 	})
 
 	It("should fail to register the BMH if the secret is missing", func() {
@@ -92,6 +87,7 @@ var _ = Describe("Inspection", Label("required", "inspection"), func() {
 		}
 		err := clusterProxy.GetClient().Create(ctx, &bmh)
 		Expect(err).NotTo(HaveOccurred())
+		toCleanup = append(toCleanup, &bmh)
 
 		By("trying to register the BMH")
 		WaitForBmhInProvisioningState(ctx, WaitForBmhInProvisioningStateInput{
@@ -106,46 +102,46 @@ var _ = Describe("Inspection", Label("required", "inspection"), func() {
 			g.Expect(clusterProxy.GetClient().Get(ctx, key, &bmh)).To(Succeed())
 			g.Expect(bmh.Status.ErrorType).To(Equal(metal3api.RegistrationError))
 		}, e2eConfig.GetIntervals(specName, "wait-registration-error")...).Should(Succeed())
-
-		By("Delete BMH")
-		err = clusterProxy.GetClient().Delete(ctx, &bmh)
-		Expect(err).NotTo(HaveOccurred())
-
-		By("Waiting for the BMH to be deleted")
-		WaitForBmhDeleted(ctx, WaitForBmhDeletedInput{
-			Client:    clusterProxy.GetClient(),
-			BmhName:   bmh.Name,
-			Namespace: bmh.Namespace,
-		}, e2eConfig.GetIntervals(specName, "wait-bmh-deleted")...)
 	})
 
-	It("should inspect a newly created BMH", func() {
-		By("Creating a secret with BMH credentials")
+	It("should inspect a BMH using fast (out-of-band) inspection", func() {
+		if bmc.AccessDetails.InspectInterface() == "" {
+			Skip("BMC driver does not support out-of-band inspection")
+		}
 
+		bmhName := specName + "-fast"
+		secretName := bmhName + "-bmc"
+
+		By("Creating a secret with BMH credentials")
 		bmcCredentialsData := map[string]string{
 			"username": bmc.User,
 			"password": bmc.Password,
 		}
-		CreateSecret(ctx, clusterProxy.GetClient(), namespace.Name, secretName, bmcCredentialsData)
+		secret := CreateSecret(ctx, clusterProxy.GetClient(), namespace.Name, secretName, bmcCredentialsData)
+		toCleanup = append(toCleanup, secret)
 
-		By("creating a BMH")
+		By("creating a BMH with inspectionMode fast")
 		bmh := metal3api.BareMetalHost{
 			ObjectMeta: metav1.ObjectMeta{
-				Name:      specName + "-inspect",
+				Name:      bmhName,
 				Namespace: namespace.Name,
 			},
 			Spec: metal3api.BareMetalHostSpec{
 				BMC: metal3api.BMCDetails{
 					Address:                        bmc.Address,
-					CredentialsName:                "bmc-credentials",
+					CredentialsName:                secretName,
 					DisableCertificateVerification: bmc.DisableCertificateVerification,
 				},
 				BootMode:       metal3api.BootMode(e2eConfig.GetVariable("BOOT_MODE")),
-				BootMACAddress: bmc.BootMacAddress,
+				InspectionMode: metal3api.InspectionModeFast,
 			},
+		}
+		if bmc.AccessDetails.NeedsMAC() {
+			bmh.Spec.BootMACAddress = bmc.BootMacAddress
 		}
 		err := clusterProxy.GetClient().Create(ctx, &bmh)
 		Expect(err).NotTo(HaveOccurred())
+		toCleanup = append(toCleanup, &bmh)
 
 		By("waiting for the BMH to be in inspecting state")
 		WaitForBmhInProvisioningState(ctx, WaitForBmhInProvisioningStateInput{
@@ -161,24 +157,151 @@ var _ = Describe("Inspection", Label("required", "inspection"), func() {
 			State:  metal3api.StateAvailable,
 		}, e2eConfig.GetIntervals(specName, "wait-available")...)
 
-		By("Delete BMH")
-		err = clusterProxy.GetClient().Delete(ctx, &bmh)
-		Expect(err).NotTo(HaveOccurred())
+		By("checking the hardware details were populated")
+		key := types.NamespacedName{Namespace: bmh.Namespace, Name: bmh.Name}
+		Expect(clusterProxy.GetClient().Get(ctx, key, &bmh)).To(Succeed())
 
-		By("Waiting for the BMH to be deleted")
-		WaitForBmhDeleted(ctx, WaitForBmhDeletedInput{
-			Client:    clusterProxy.GetClient(),
-			BmhName:   bmh.Name,
-			Namespace: bmh.Namespace,
-		}, e2eConfig.GetIntervals(specName, "wait-bmh-deleted")...)
+		Expect(bmh.Status.HardwareDetails).NotTo(BeNil())
+		Expect(bmh.Status.HardwareDetails.RAMMebibytes).To(BeNumerically(">", 0))
+		Expect(bmh.Status.HardwareDetails.CPU.Count).To(BeNumerically(">", 0))
+		Expect(bmh.Status.HardwareDetails.NIC).NotTo(BeEmpty())
+
+		By("checking that HardwareData resource was created")
+		hwData := &metal3api.HardwareData{}
+		Expect(clusterProxy.GetClient().Get(ctx, key, hwData)).To(Succeed())
+
+		Expect(hwData.Spec.HardwareDetails).NotTo(BeNil())
+		Expect(hwData.Spec.HardwareDetails.RAMMebibytes).To(BeNumerically(">", 0))
+		Expect(hwData.Spec.HardwareDetails.CPU.Count).To(BeNumerically(">", 0))
+		Expect(hwData.Spec.HardwareDetails.NIC).NotTo(BeEmpty())
+
+		if e2eConfig.GetBoolVariable("DEPLOY_IRONIC") {
+			By("checking that fast inspection did not populate a hostname or IP (no ramdisk was booted)")
+			Expect(bmh.Status.HardwareDetails.Hostname).To(BeEmpty())
+			Expect(bmh.Status.HardwareDetails.NIC[0].IP).To(BeEmpty())
+			Expect(hwData.Spec.HardwareDetails.Hostname).To(BeEmpty())
+			Expect(hwData.Spec.HardwareDetails.NIC[0].IP).To(BeEmpty())
+		}
+	})
+
+	It("should inspect a newly created BMH", func() {
+		By("Creating a secret with BMH credentials")
+
+		bmcCredentialsData := map[string]string{
+			"username": bmc.User,
+			"password": bmc.Password,
+		}
+		secret := CreateSecret(ctx, clusterProxy.GetClient(), namespace.Name, "bmc-credentials", bmcCredentialsData)
+		toCleanup = append(toCleanup, secret)
+
+		By("creating a BMH")
+		bmh := metal3api.BareMetalHost{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      specName + "-inspect",
+				Namespace: namespace.Name,
+			},
+			Spec: metal3api.BareMetalHostSpec{
+				BMC: metal3api.BMCDetails{
+					Address:                        bmc.Address,
+					CredentialsName:                "bmc-credentials",
+					DisableCertificateVerification: bmc.DisableCertificateVerification,
+				},
+				BootMode: metal3api.BootMode(e2eConfig.GetVariable("BOOT_MODE")),
+			},
+		}
+		// BootMacAddress is optional for redfish-virtualmedia
+		if bmc.AccessDetails.NeedsMAC() {
+			bmh.Spec.BootMACAddress = bmc.BootMacAddress
+		}
+		err := clusterProxy.GetClient().Create(ctx, &bmh)
+		Expect(err).NotTo(HaveOccurred())
+		toCleanup = append(toCleanup, &bmh)
+
+		By("waiting for the BMH to be in inspecting state")
+		WaitForBmhInProvisioningState(ctx, WaitForBmhInProvisioningStateInput{
+			Client: clusterProxy.GetClient(),
+			Bmh:    bmh,
+			State:  metal3api.StateInspecting,
+		}, e2eConfig.GetIntervals(specName, "wait-inspecting")...)
+
+		By("waiting for the BMH to become available")
+		WaitForBmhInProvisioningState(ctx, WaitForBmhInProvisioningStateInput{
+			Client: clusterProxy.GetClient(),
+			Bmh:    bmh,
+			State:  metal3api.StateAvailable,
+		}, e2eConfig.GetIntervals(specName, "wait-available")...)
+
+		if e2eConfig.GetVariable("SSH_CHECK_PROVISIONED") == "true" {
+			By("verifying IPA booted from the expected Ironic-managed boot source")
+			VerifyIronicManagedBoot(e2eConfig, bmc.Address, bmc.IPAddress)
+		} else {
+			Logf("WARNING: Skipping boot source verification since SSH_CHECK_PROVISIONED != true")
+		}
+
+		if e2eConfig.GetBoolVariable("DEPLOY_IRONIC") {
+			getMacList := func(ports []ironicPort.Port) []string {
+				macs := make([]string, 0, len(ports))
+				for _, port := range ports {
+					macs = append(macs, port.Address)
+				}
+				return macs
+			}
+			ironicNodeName := IronicNodeName(bmh.Namespace, bmh.Name)
+
+			By("Get ports in Ironic before detachment and check if they are not empty")
+			portsBefore, errPortsBefore := getIronicNodePorts(ctx, e2eConfig, ironicNodeName)
+			Expect(errPortsBefore).NotTo(HaveOccurred())
+			Expect(portsBefore).To(Not(BeEmpty()))
+
+			By("Adding the detached annotation")
+			AnnotateBmh(ctx, clusterProxy.GetClient(), bmh, metal3api.DetachedAnnotation, forceTrue)
+
+			By("Waiting for the BMH to be detached")
+			WaitForBmhInOperationalStatus(ctx, WaitForBmhInOperationalStatusInput{
+				Client: clusterProxy.GetClient(),
+				Bmh:    bmh,
+				State:  metal3api.OperationalStatusDetached,
+				UndesiredStates: []metal3api.OperationalStatus{
+					metal3api.OperationalStatusError,
+				},
+			}, e2eConfig.GetIntervals(specName, "wait-detached")...)
+
+			By("Retrieving the latest BMH object")
+			err = clusterProxy.GetClient().Get(ctx, types.NamespacedName{
+				Name:      bmh.Name,
+				Namespace: bmh.Namespace,
+			}, &bmh)
+			Expect(err).NotTo(HaveOccurred())
+
+			By("Removing the detached annotation")
+			AnnotateBmh(ctx, clusterProxy.GetClient(), bmh, metal3api.DetachedAnnotation, nil)
+
+			By("Waiting for BMH to be reconciled")
+			WaitForBmhReconciled(ctx, clusterProxy.GetClient(), bmh,
+				e2eConfig.GetIntervals("default", "wait-deployment")...)
+
+			By("Waiting for the BMH to be OK")
+			WaitForBmhInOperationalStatus(ctx, WaitForBmhInOperationalStatusInput{
+				Client: clusterProxy.GetClient(),
+				Bmh:    bmh,
+				State:  metal3api.OperationalStatusOK,
+				UndesiredStates: []metal3api.OperationalStatus{
+					metal3api.OperationalStatusError,
+				},
+			}, e2eConfig.GetIntervals(specName, "wait-deployment")...)
+
+			By("Get ports in Ironic after re-attachment and check if they are the same")
+			portsAfter, errPortsAfter := getIronicNodePorts(ctx, e2eConfig, ironicNodeName)
+			Expect(errPortsAfter).NotTo(HaveOccurred())
+			Expect(getMacList(portsAfter)).To(ConsistOf(getMacList(portsBefore)))
+		}
 	})
 
 	AfterEach(func() {
 		CollectSerialLogs(bmc.Name, path.Join(artifactFolder, specName))
 		DumpResources(ctx, e2eConfig, clusterProxy, path.Join(artifactFolder, specName))
 		if !skipCleanup {
-			isNamespaced := e2eConfig.GetBoolVariable("NAMESPACE_SCOPED")
-			Cleanup(ctx, clusterProxy, namespace, cancelWatches, isNamespaced, e2eConfig.GetIntervals("default", "wait-namespace-deleted")...)
+			Cleanup(ctx, clusterProxy, namespace, cancelWatches, e2eConfig, toCleanup)
 		}
 	})
 })

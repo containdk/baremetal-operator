@@ -24,6 +24,7 @@ import (
 
 	"github.com/go-logr/logr"
 	metal3api "github.com/metal3-io/baremetal-operator/apis/metal3.io/v1alpha1"
+	. "github.com/metal3-io/baremetal-operator/pkg/logging"
 	"github.com/metal3-io/baremetal-operator/pkg/provisioner"
 	corev1 "k8s.io/api/core/v1"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
@@ -95,8 +96,8 @@ func (info *rhfcInfo) publishEvent(reason, message string) {
 
 // Reconcile handles changes to HostFirmwareComponents resources.
 func (r *HostFirmwareComponentsReconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ctrl.Result, err error) {
-	reqLogger := r.Log.WithValues("hostfirmwarecomponents", req.NamespacedName)
-	reqLogger.Info("start")
+	reqLogger := r.Log.WithValues(LogFieldHostFirmwareComponents, req.NamespacedName)
+	reqLogger.V(VerbosityLevelTrace).Info("reconciliation started")
 
 	// Get the corresponding baremetalhost in this namespace, if one doesn't exist don't continue processing
 	bmh := &metal3api.BareMetalHost{}
@@ -119,7 +120,7 @@ func (r *HostFirmwareComponentsReconciler) Reconcile(ctx context.Context, req ct
 	if err = r.Get(ctx, req.NamespacedName, hfc); err != nil {
 		// The HFC resource may have been deleted
 		if k8serrors.IsNotFound(err) {
-			reqLogger.Info("HostFirmwareComponents not found")
+			reqLogger.V(VerbosityLevelDebug).Info("HostFirmwareComponents not found")
 			return ctrl.Result{}, nil
 		}
 		// Error reading the object - requeue the request.
@@ -130,35 +131,30 @@ func (r *HostFirmwareComponentsReconciler) Reconcile(ctx context.Context, req ct
 	info := &rhfcInfo{log: reqLogger, hfc: hfc, bmh: bmh}
 	prov, err := r.ProvisionerFactory.NewProvisioner(ctx, provisioner.BuildHostDataNoBMC(*bmh), info.publishEvent)
 	if err != nil {
+		if errors.Is(err, provisioner.ErrNotReady) {
+			reqLogger.Info("provisioner is not ready",
+				LogFieldError, err.Error(),
+				LogFieldRequeueAfter, provisionerRetryDelay)
+			return ctrl.Result{RequeueAfter: provisionerRetryDelay}, nil
+		}
 		return ctrl.Result{}, fmt.Errorf("failed to create provisioner: %w", err)
 	}
 
-	ready, err := prov.TryInit(ctx)
-	if err != nil || !ready {
-		var msg string
-		if err == nil {
-			msg = "not ready"
-		} else {
-			msg = err.Error()
-		}
-		reqLogger.Info("provisioner is not ready", "Error", msg, "RequeueAfter", provisionerRetryDelay)
-		return ctrl.Result{Requeue: true, RequeueAfter: provisionerRetryDelay}, nil
-	}
-
-	info.log.V(1).Info("retrieving firmware components and saving to resource", "Node", bmh.Status.Provisioning.ID)
+	info.log.V(VerbosityLevelDebug).Info("retrieving firmware components and saving to resource",
+		LogFieldNode, bmh.Status.Provisioning.ID)
 	// Check ironic for the components information if possible
 	components, err := prov.GetFirmwareComponents(ctx)
 
 	if err != nil {
-		if errors.Is(err, provisioner.ErrFirmwareUpdateUnsupported) {
-			return ctrl.Result{}, nil
-		}
-		reqLogger.Info("provisioner returns error", "Error", err.Error(), "RequeueAfter", provisionerRetryDelay)
+		reqLogger.Info("provisioner returns error",
+			LogFieldError, err.Error(),
+			LogFieldRequeueAfter, provisionerRetryDelay)
 		return ctrl.Result{Requeue: true, RequeueAfter: provisionerRetryDelay}, nil
 	}
 
 	if err = r.updateHostFirmware(ctx, info, components); err != nil {
-		info.log.Info("updateHostFirmware returned error")
+		info.log.Info("updateHostFirmware returned error",
+			LogFieldError, err.Error())
 		return ctrl.Result{}, fmt.Errorf("could not update hostfirmwarecomponents: %w", err)
 	}
 
@@ -223,7 +219,7 @@ func (r *HostFirmwareComponentsReconciler) updateHostFirmware(ctx context.Contex
 
 	// Update Status if has changed
 	if dirty {
-		info.log.Info("Status for HostFirmwareComponents changed")
+		info.log.V(VerbosityLevelDebug).Info("status for HostFirmwareComponents changed")
 		info.hfc.Status = *newStatus.DeepCopy()
 
 		t := metav1.Now()
@@ -246,10 +242,25 @@ func (r *HostFirmwareComponentsReconciler) SetupWithManager(mgr ctrl.Manager, ma
 		Complete(r)
 }
 
+// updateEventHandler ensures no reconciliation happens for unimportant changes like finalizers or annotations.
 func (r *HostFirmwareComponentsReconciler) updateEventHandler(e event.UpdateEvent) bool {
-	r.Log.Info("hostfirmwarecomponents in event handler")
+	r.Log.V(VerbosityLevelTrace).Info("hostfirmwarecomponents in event handler")
 
-	return e.ObjectNew.GetGeneration() != e.ObjectOld.GetGeneration()
+	// If the update increased the resource Generation then let's process it
+	if e.ObjectNew.GetGeneration() != e.ObjectOld.GetGeneration() {
+		r.Log.V(VerbosityLevelDebug).Info("returning true as generation changed from event handler")
+		return true
+	}
+
+	// NOTE(dtantsur): the only realistic case of a changed owner reference is when pre-created HFC is adopted by a BMH that was created later.
+	// In this case, it's reasonable to reconcile the resource using the information from the new BMH.
+	if !reflect.DeepEqual(e.ObjectNew.GetOwnerReferences(), e.ObjectOld.GetOwnerReferences()) {
+		r.Log.V(VerbosityLevelDebug).Info("processing event for changed owner reference", "namespace", e.ObjectNew.GetNamespace(), "name", e.ObjectNew.GetName())
+		return true
+	}
+
+	r.Log.V(VerbosityLevelDebug).Info("ignoring event that did not change generation or owners", "namespace", e.ObjectNew.GetNamespace(), "name", e.ObjectNew.GetName())
+	return false
 }
 
 func (r *HostFirmwareComponentsReconciler) validateHostFirmwareComponents(info *rhfcInfo) []error {
@@ -264,12 +275,16 @@ func (r *HostFirmwareComponentsReconciler) validateHostFirmwareComponents(info *
 }
 
 func (r *HostFirmwareComponentsReconciler) publishEvent(ctx context.Context, request ctrl.Request, event corev1.Event) {
-	reqLogger := r.Log.WithValues("hostfirmwarecomponents", request.NamespacedName)
-	reqLogger.Info("publishing event", "reason", event.Reason, "message", event.Message)
+	reqLogger := r.Log.WithValues(LogFieldHostFirmwareComponents, request.NamespacedName)
+	reqLogger.V(VerbosityLevelDebug).Info("publishing event",
+		LogFieldReason, event.Reason,
+		"message", event.Message)
 	err := r.Create(ctx, &event)
 	if err != nil {
 		reqLogger.Info("failed to record event, ignoring",
-			"reason", event.Reason, "message", event.Message, "error", err)
+			LogFieldReason, event.Reason,
+			"message", event.Message,
+			LogFieldError, err)
 	}
 }
 

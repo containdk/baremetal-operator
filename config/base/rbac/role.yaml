@@ -18,11 +18,14 @@ rules:
   - namespaces
   verbs:
   - get
+  - list
+  - watch
 - apiGroups:
   - ""
   resources:
   - secrets
   verbs:
+  - delete
   - get
   - list
   - update
@@ -69,6 +72,7 @@ rules:
   - metal3.io
   resources:
   - baremetalhosts/status
+  - baremetalswitches/status
   - bmceventsubscriptions/status
   - dataimages/status
   - firmwareschemas/status
@@ -83,6 +87,7 @@ rules:
 - apiGroups:
   - metal3.io
   resources:
+  - baremetalswitches
   - hostdeploypolicies
   verbs:
   - get
@@ -93,6 +98,7 @@ rules:
   resources:
   - hostupdatepolicies
   verbs:
+  - delete
   - get
   - list
   - update

@@ -3,11 +3,16 @@ kind: Kustomization
 resources:
 - ../basic-auth_tls
 - ./automated-cleaning
+- ./baremetalswitch
 - ./basic-ops
 - ./external-inspection
 - ./externally-provisioned
+- ./firmware-components
+- ./firmware-settings
+- ./force-detach
 - ./inspection
 - ./live-iso-ops
+- ./network-data
 - ./provisioning-ops
 - ./re-inspection
 - ./upgrade-bmo

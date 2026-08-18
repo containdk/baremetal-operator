@@ -215,6 +215,49 @@ func TestDeprovisioningCapacity(t *testing.T) {
 	}
 }
 
+// TestRegisterHostPersistsCredentialsWhileWaitingForPreprovisioningImage
+// ensures that, when registration cannot complete because the
+// PreprovisioningImage is not yet available, any state already detected
+// during this reconcile (such as newly tried credentials) is still saved.
+// Otherwise the same work is repeated, and logged, on every reconcile
+// until the image becomes available.
+func TestRegisterHostPersistsCredentialsWhileWaitingForPreprovisioningImage(t *testing.T) {
+	testHost := host(metal3api.StateInspecting).build()
+	// Simulate credentials that have not been tried yet.
+	testHost.Status.TriedCredentials.Version = "99"
+
+	reconciler := testNewReconciler(testHost)
+	prov := newMockProvisioner()
+	prov.preprovImageFormats = []metal3api.ImageFormat{metal3api.ImageFormatISO}
+	prov.registerErr = provisioner.ErrNeedsPreprovisioningImage
+
+	info := makeDefaultReconcileInfo(testHost)
+
+	result := reconciler.registerHost(t.Context(), prov, info)
+
+	assert.True(t, result.Dirty(), "expected a dirty result so newly tried credentials are persisted")
+	assert.Equal(t, info.bmcCredsSecret.ResourceVersion, testHost.Status.TriedCredentials.Version)
+}
+
+// TestRegisterHostNotDirtyWhileWaitingForPreprovisioningImage ensures that,
+// when there is nothing new to persist, waiting for the PreprovisioningImage
+// still results in a plain (non-dirty) retry rather than forcing an
+// unnecessary status update on every reconcile.
+func TestRegisterHostNotDirtyWhileWaitingForPreprovisioningImage(t *testing.T) {
+	testHost := host(metal3api.StateInspecting).build()
+
+	reconciler := testNewReconciler(testHost)
+	prov := newMockProvisioner()
+	prov.preprovImageFormats = []metal3api.ImageFormat{metal3api.ImageFormatISO}
+	prov.registerErr = provisioner.ErrNeedsPreprovisioningImage
+
+	info := makeDefaultReconcileInfo(testHost)
+
+	result := reconciler.registerHost(t.Context(), prov, info)
+
+	assert.False(t, result.Dirty(), "expected no forced status update when nothing changed")
+}
+
 func TestDetach(t *testing.T) {
 	testCases := []struct {
 		Scenario                  string
@@ -1279,9 +1322,11 @@ func newMockProvisioner() *mockProvisioner {
 }
 
 type mockProvisioner struct {
-	hasCapacity  bool
-	nextResults  map[string]provisioner.Result
-	callsNoError map[string]bool
+	hasCapacity         bool
+	nextResults         map[string]provisioner.Result
+	callsNoError        map[string]bool
+	registerErr         error
+	preprovImageFormats []metal3api.ImageFormat
 }
 
 func (m *mockProvisioner) getNextResultByMethod(name string) (result provisioner.Result) {
@@ -1316,11 +1361,11 @@ func (m *mockProvisioner) calledNoError(methodName string) bool {
 }
 
 func (m *mockProvisioner) Register(_ context.Context, _ provisioner.ManagementAccessData, _, _ bool) (result provisioner.Result, provID string, err error) {
-	return m.getNextResultByMethod("ValidateManagementAccess"), "", err
+	return m.getNextResultByMethod("ValidateManagementAccess"), "", m.registerErr
 }
 
-func (m *mockProvisioner) PreprovisioningImageFormats() ([]metal3api.ImageFormat, error) {
-	return nil, nil
+func (m *mockProvisioner) PreprovisioningImageFormats(_ context.Context) ([]metal3api.ImageFormat, error) {
+	return m.preprovImageFormats, nil
 }
 
 func (m *mockProvisioner) InspectHardware(_ context.Context, _ provisioner.InspectData, _, _, _ bool) (result provisioner.Result, started bool, details *metal3api.HardwareDetails, err error) {
@@ -1352,11 +1397,11 @@ func (m *mockProvisioner) Deprovision(_ context.Context, _ bool, _ metal3api.Aut
 	return m.getNextResultByMethod("Deprovision"), err
 }
 
-func (m *mockProvisioner) Delete(context.Context) (result provisioner.Result, err error) {
+func (m *mockProvisioner) Delete(_ context.Context) (result provisioner.Result, err error) {
 	return m.getNextResultByMethod("Delete"), err
 }
 
-func (m *mockProvisioner) Detach(context.Context) (result provisioner.Result, err error) {
+func (m *mockProvisioner) Detach(_ context.Context, _ bool) (result provisioner.Result, err error) {
 	res := m.getNextResultByMethod("Detach")
 	return res, err
 }
@@ -1367,10 +1412,6 @@ func (m *mockProvisioner) PowerOn(_ context.Context, _ bool) (result provisioner
 
 func (m *mockProvisioner) PowerOff(_ context.Context, _ metal3api.RebootMode, _ bool, _ metal3api.AutomatedCleaningMode) (result provisioner.Result, err error) {
 	return m.getNextResultByMethod("PowerOff"), err
-}
-
-func (m *mockProvisioner) TryInit(context.Context) (result bool, err error) {
-	return
 }
 
 func (m *mockProvisioner) GetFirmwareSettings(_ context.Context, _ bool) (settings metal3api.SettingsMap, schema map[string]metal3api.SettingSchema, err error) {
@@ -1483,6 +1524,152 @@ func TestUpdateBootModeStatus(t *testing.T) {
 			changed := updateBootModeStatus(&host)
 			assert.Equal(t, tc.ExpectedChange, changed, "unexpected change response")
 			assert.Equal(t, tc.ExpectedValue, host.Status.Provisioning.BootMode)
+		})
+	}
+}
+
+func TestProvisioningRetryLimit(t *testing.T) {
+	testCases := []struct {
+		Scenario string
+
+		Host                   *metal3api.BareMetalHost
+		MaxProvisioningRetries int
+
+		ExpectedState             metal3api.ProvisioningState
+		ExpectedProvisioningFail  int
+		ExpectedOperationalStatus metal3api.OperationalStatus
+	}{
+		{
+			Scenario: "provisioning-error-increments-fail-count",
+			Host: func() *metal3api.BareMetalHost {
+				h := host(metal3api.StateProvisioning).build()
+				h.Status.ErrorType = metal3api.ProvisioningError
+				h.Status.ErrorMessage = "deploy failed"
+				h.Status.ProvisioningFailCount = 2
+				return h
+			}(),
+			MaxProvisioningRetries: 5,
+
+			ExpectedState:             metal3api.StateDeprovisioning,
+			ExpectedProvisioningFail:  3,
+			ExpectedOperationalStatus: metal3api.OperationalStatusOK,
+		},
+		{
+			Scenario: "retry-limit-reached-stays-available",
+			Host: func() *metal3api.BareMetalHost {
+				h := host(metal3api.StateAvailable).SaveHostProvisioningSettings().build()
+				h.Status.ProvisioningFailCount = 5
+				h.Status.LastAttemptedImage = &metal3api.Image{URL: "not-empty"}
+				return h
+			}(),
+			MaxProvisioningRetries: 5,
+
+			ExpectedState:             metal3api.StateAvailable,
+			ExpectedProvisioningFail:  5,
+			ExpectedOperationalStatus: metal3api.OperationalStatusError,
+		},
+		{
+			Scenario: "below-retry-limit-allows-provisioning",
+			Host: func() *metal3api.BareMetalHost {
+				h := host(metal3api.StateAvailable).SaveHostProvisioningSettings().build()
+				h.Status.ProvisioningFailCount = 4
+				h.Status.LastAttemptedImage = &metal3api.Image{URL: "not-empty"}
+				return h
+			}(),
+			MaxProvisioningRetries: 5,
+
+			ExpectedState:             metal3api.StateProvisioning,
+			ExpectedProvisioningFail:  4,
+			ExpectedOperationalStatus: metal3api.OperationalStatusOK,
+		},
+		{
+			Scenario: "image-url-change-resets-fail-count",
+			Host: func() *metal3api.BareMetalHost {
+				h := host(metal3api.StateAvailable).SaveHostProvisioningSettings().build()
+				h.Status.ProvisioningFailCount = 5
+				h.Status.LastAttemptedImage = &metal3api.Image{URL: "old-image-url", Checksum: "abc123"}
+				h.Spec.Image = &metal3api.Image{URL: "new-image-url", Checksum: "abc123"}
+				return h
+			}(),
+			MaxProvisioningRetries: 5,
+
+			ExpectedState:             metal3api.StateProvisioning,
+			ExpectedProvisioningFail:  0,
+			ExpectedOperationalStatus: metal3api.OperationalStatusOK,
+		},
+		{
+			Scenario: "checksum-change-resets-fail-count",
+			Host: func() *metal3api.BareMetalHost {
+				h := host(metal3api.StateAvailable).SaveHostProvisioningSettings().build()
+				h.Status.ProvisioningFailCount = 5
+				h.Status.LastAttemptedImage = &metal3api.Image{URL: "not-empty", Checksum: "old-checksum"}
+				h.Spec.Image = &metal3api.Image{URL: "not-empty", Checksum: "new-checksum"}
+				return h
+			}(),
+			MaxProvisioningRetries: 5,
+
+			ExpectedState:             metal3api.StateProvisioning,
+			ExpectedProvisioningFail:  0,
+			ExpectedOperationalStatus: metal3api.OperationalStatusOK,
+		},
+		{
+			Scenario: "same-image-does-not-reset-fail-count",
+			Host: func() *metal3api.BareMetalHost {
+				h := host(metal3api.StateAvailable).SaveHostProvisioningSettings().build()
+				h.Status.ProvisioningFailCount = 3
+				h.Status.LastAttemptedImage = &metal3api.Image{URL: "not-empty", Checksum: "abc123"}
+				h.Spec.Image = &metal3api.Image{URL: "not-empty", Checksum: "abc123"}
+				return h
+			}(),
+			MaxProvisioningRetries: 5,
+
+			ExpectedState:             metal3api.StateProvisioning,
+			ExpectedProvisioningFail:  3,
+			ExpectedOperationalStatus: metal3api.OperationalStatusOK,
+		},
+		{
+			Scenario: "limit-zero-disables-retry-limit",
+			Host: func() *metal3api.BareMetalHost {
+				h := host(metal3api.StateAvailable).SaveHostProvisioningSettings().build()
+				h.Status.ProvisioningFailCount = 100
+				h.Status.LastAttemptedImage = &metal3api.Image{URL: "not-empty"}
+				return h
+			}(),
+			MaxProvisioningRetries: 0,
+
+			ExpectedState:             metal3api.StateProvisioning,
+			ExpectedProvisioningFail:  100,
+			ExpectedOperationalStatus: metal3api.OperationalStatusOK,
+		},
+		{
+			Scenario: "successful-provisioning-resets-fail-count",
+			Host: func() *metal3api.BareMetalHost {
+				h := host(metal3api.StateProvisioning).build()
+				h.Status.ProvisioningFailCount = 3
+				return h
+			}(),
+			MaxProvisioningRetries: 5,
+
+			ExpectedState:             metal3api.StateProvisioned,
+			ExpectedProvisioningFail:  0,
+			ExpectedOperationalStatus: metal3api.OperationalStatusOK,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.Scenario, func(t *testing.T) {
+			prov := newMockProvisioner()
+			prov.setHasCapacity(true)
+			reconciler := testNewReconciler(tc.Host)
+			reconciler.MaxProvisioningRetries = tc.MaxProvisioningRetries
+			hsm := newHostStateMachine(tc.Host, reconciler, prov, true)
+			info := makeDefaultReconcileInfo(tc.Host)
+
+			hsm.ReconcileState(t.Context(), info)
+
+			assert.Equal(t, tc.ExpectedState, tc.Host.Status.Provisioning.State)
+			assert.Equal(t, tc.ExpectedProvisioningFail, tc.Host.Status.ProvisioningFailCount)
+			assert.Equal(t, tc.ExpectedOperationalStatus, tc.Host.Status.OperationalStatus)
 		})
 	}
 }

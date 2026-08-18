@@ -10,6 +10,7 @@ import (
 
 	"github.com/gophercloud/gophercloud/v2"
 	"github.com/gophercloud/gophercloud/v2/openstack/baremetal/v1/nodes"
+	"github.com/gophercloud/gophercloud/v2/openstack/baremetal/v1/ports"
 	metal3api "github.com/metal3-io/baremetal-operator/apis/metal3.io/v1alpha1"
 	"github.com/metal3-io/baremetal-operator/pkg/hardwareutils/bmc"
 	"github.com/metal3-io/baremetal-operator/pkg/hostclaim"
@@ -55,6 +56,13 @@ func (p *ironicProvisioner) Register(ctx context.Context, data provisioner.Manag
 		return result, "", err
 	}
 
+	if data.InspectionMode == metal3api.InspectionModeFast && bmcAccess.InspectInterface() == "" {
+		msg := fmt.Sprintf("BMC driver %s does not support fast (out-of-band) inspection", bmcAccess.Type())
+		p.log.Info(msg)
+		result, err = operationFailed(msg)
+		return result, "", err
+	}
+
 	if data.BootMode == metal3api.UEFISecureBoot && !bmcAccess.SupportsSecureBoot() {
 		msg := fmt.Sprintf("BMC driver %s does not support secure boot", bmcAccess.Type())
 		p.log.Info(msg)
@@ -94,9 +102,12 @@ func (p *ironicProvisioner) Register(ctx context.Context, data provisioner.Manag
 		return result, "", err
 	}
 
-	// Some BMC types require a MAC address, so ensure we have one
-	// when we need it. If not, place the host in an error state.
-	if bmcAccess.NeedsMAC() && p.bootMACAddress == "" {
+	// Some BMC types require a MAC address regardless of inspection (for
+	// example VirtualBMC), and any host requires one when inspection is
+	// disabled because the MAC cannot be discovered. Ensure we have one when
+	// we need it; if not, place the host in an error state. This mirrors the
+	// combined rule enforced by the validating webhook.
+	if (bmcAccess.NeedsMAC() || data.DisableInspection) && p.bootMACAddress == "" {
 		msg := fmt.Sprintf("BMC driver %s requires a BootMACAddress value", bmcAccess.Type())
 		p.log.Info(msg)
 		result, err = operationFailed(msg)
@@ -116,7 +127,7 @@ func (p *ironicProvisioner) Register(ctx context.Context, data provisioner.Manag
 			return result, "", err
 		}
 		if retry {
-			result, err = retryAfterDelay(provisionRequeueDelay)
+			result, err = retryAfterDelay(shortRetryDelay)
 			return result, "", err
 		}
 		// Store the ID so other methods can assume it is set and so
@@ -130,16 +141,6 @@ func (p *ironicProvisioner) Register(ctx context.Context, data provisioner.Manag
 		provID = ironicNode.UUID
 
 		updater.SetTopLevelOpt("name", ironicNodeName(p.objectMeta), ironicNode.Name)
-
-		// When node exists but has no assigned port to it by Ironic and actuall address (MAC) is present
-		// in host config and is not allocated to different node lets try to create port for this node.
-		if p.bootMACAddress != "" {
-			err = p.ensurePort(ctx, ironicNode)
-			if err != nil {
-				result, err = transientError(err)
-				return result, provID, err
-			}
-		}
 
 		bmcAddressChanged := !bmcAddressMatches(ironicNode, driverInfo)
 
@@ -171,6 +172,24 @@ func (p *ironicProvisioner) Register(ctx context.Context, data provisioner.Manag
 		// We don't return here because we also have to set the
 		// target provision state to manageable, which happens
 		// below.
+	}
+
+	// NOTE(dtantsur): don't try to create ports in states where it's
+	// either impossible because of a lock or potentially disruptive.
+	switch nodes.ProvisionState(ironicNode.ProvisionState) {
+	case nodes.Enroll, nodes.Manageable, nodes.Available, nodes.Active,
+		// A failure can be caused by wrong ports, so allow creating.
+		// TODO(dtantsur): add Hold states once they're supported by Gophercloud
+		nodes.AdoptFail, nodes.InspectFail, nodes.CleanFail, nodes.DeployFail, nodes.ServiceFail, nodes.Error:
+		// Try to create ports from two sources
+		// bootMACAddress if available
+		// HardwareData whenever inspection data is available.
+		err = p.createPortsForNode(ctx, ironicNode, data.HardwareData)
+		if err != nil {
+			result, err = transientError(err)
+			return result, provID, err
+		}
+	default:
 	}
 
 	// If no PreprovisioningImage builder is enabled we set the Node network_data
@@ -216,7 +235,7 @@ func (p *ironicProvisioner) Register(ctx context.Context, data provisioner.Manag
 		if ironicNode.TargetProvisionState == string(nodes.TargetManage) {
 			// We have already tried to manage the node and did not
 			// get an error, so do nothing and keep trying.
-			result, err = operationContinuing(provisionRequeueDelay)
+			result, err = operationContinuing(shortRetryDelay)
 			return result, provID, err
 		}
 
@@ -231,7 +250,7 @@ func (p *ironicProvisioner) Register(ctx context.Context, data provisioner.Manag
 		// If we're still waiting for the state to change in Ironic,
 		// return true to indicate that we're dirty and need to be
 		// reconciled again.
-		result, err = operationContinuing(provisionRequeueDelay)
+		result, err = operationContinuing(shortRetryDelay)
 		return result, provID, err
 
 	case nodes.CleanWait,
@@ -254,6 +273,15 @@ func (p *ironicProvisioner) Register(ctx context.Context, data provisioner.Manag
 	}
 }
 
+func inspectInterfaceForMode(mode metal3api.InspectionMode, bmcAccess bmc.AccessDetails) string {
+	if mode == metal3api.InspectionModeFast {
+		if iface := bmcAccess.InspectInterface(); iface != "" {
+			return iface
+		}
+	}
+	return defaultInspectInterface
+}
+
 func (p *ironicProvisioner) enrollNode(ctx context.Context, data provisioner.ManagementAccessData, bmcAccess bmc.AccessDetails, driverInfo map[string]any) (ironicNode *nodes.Node, retry bool, err error) {
 	nodeCreateOpts := nodes.CreateOpts{
 		Driver:              bmcAccess.Driver(),
@@ -263,7 +291,7 @@ func (p *ironicProvisioner) enrollNode(ctx context.Context, data provisioner.Man
 		DriverInfo:          driverInfo,
 		FirmwareInterface:   bmcAccess.FirmwareInterface(),
 		DeployInterface:     p.deployInterface(data),
-		InspectInterface:    defaultInspectInterface,
+		InspectInterface:    inspectInterfaceForMode(data.InspectionMode, bmcAccess),
 		ManagementInterface: bmcAccess.ManagementInterface(),
 		PowerInterface:      bmcAccess.PowerInterface(),
 		RAIDInterface:       bmcAccess.RAIDInterface(),
@@ -289,35 +317,48 @@ func (p *ironicProvisioner) enrollNode(ctx context.Context, data provisioner.Man
 		return nil, true, fmt.Errorf("failed to register host in ironic: %w", err)
 	}
 
-	// If we know the MAC, create a port. Otherwise we will have
-	// to do this after we run the introspection step.
-	if p.bootMACAddress != "" {
-		err = p.createPXEEnabledNodePort(ctx, ironicNode.UUID, p.bootMACAddress)
-		if err != nil {
-			return nil, true, err
-		}
-	}
-
 	return ironicNode, false, nil
 }
 
-func (p *ironicProvisioner) ensurePort(ctx context.Context, ironicNode *nodes.Node) error {
-	nodeHasAssignedPort, err := p.nodeHasAssignedPort(ctx, ironicNode)
+func (p *ironicProvisioner) createPortsForNode(ctx context.Context, ironicNode *nodes.Node, hardwareData *metal3api.HardwareData) error {
+	var nics []metal3api.NIC
+	if hardwareData != nil && hardwareData.Spec.HardwareDetails != nil {
+		nics = hardwareData.Spec.HardwareDetails.NIC
+	}
+
+	if p.bootMACAddress == "" && len(nics) == 0 {
+		// we don't have anything to process, gracefully returning
+		return nil
+	}
+
+	ironicNodePorts, err := p.getPorts(ctx, ironicNode.UUID, "")
 	if err != nil {
 		return err
 	}
 
-	if !nodeHasAssignedPort {
-		addressIsAllocatedToPort, err := p.isAddressAllocatedToPort(ctx, p.bootMACAddress)
+	ironicNodePortsList := map[string]ports.Port{}
+	for _, port := range ironicNodePorts {
+		ironicNodePortsList[port.Address] = port
+	}
+
+	// Mac/PXE status map
+	portMacsToCreate := map[string]bool{}
+	for _, nic := range nics {
+		if _, ok := ironicNodePortsList[nic.MAC]; nic.MAC != "" && !ok {
+			portMacsToCreate[nic.MAC] = nic.PXE
+		}
+	}
+
+	if _, ok := ironicNodePortsList[p.bootMACAddress]; p.bootMACAddress != "" && !ok {
+		portMacsToCreate[p.bootMACAddress] = true
+	}
+
+	p.log.Info("creating ports for node", "nodeUUID", ironicNode.UUID, "MACs", portMacsToCreate)
+
+	for mac, pxe := range portMacsToCreate {
+		err := p.createNodePort(ctx, ironicNode.UUID, mac, pxe)
 		if err != nil {
 			return err
-		}
-
-		if !addressIsAllocatedToPort {
-			err = p.createPXEEnabledNodePort(ctx, ironicNode.UUID, p.bootMACAddress)
-			if err != nil {
-				return err
-			}
 		}
 	}
 

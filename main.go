@@ -16,10 +16,15 @@ limitations under the License.
 package main
 
 import (
+	"cmp"
+	"context"
 	"crypto/tls"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
+	"path/filepath"
+	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
@@ -28,14 +33,13 @@ import (
 	metal3api "github.com/metal3-io/baremetal-operator/apis/metal3.io/v1alpha1"
 	metal3iocontroller "github.com/metal3-io/baremetal-operator/internal/controller/metal3.io"
 	webhooks "github.com/metal3-io/baremetal-operator/internal/webhooks/metal3.io/v1alpha1"
+	ppicontroller "github.com/metal3-io/baremetal-operator/pkg/controllers"
+	"github.com/metal3-io/baremetal-operator/pkg/hostclaim"
 	"github.com/metal3-io/baremetal-operator/pkg/imageprovider"
 	"github.com/metal3-io/baremetal-operator/pkg/provisioner"
-	"github.com/metal3-io/baremetal-operator/pkg/provisioner/demo"
 	"github.com/metal3-io/baremetal-operator/pkg/provisioner/fixture"
-	"github.com/metal3-io/baremetal-operator/pkg/provisioner/ironic"
 	"github.com/metal3-io/baremetal-operator/pkg/secretutils"
 	"github.com/metal3-io/baremetal-operator/pkg/version"
-	ironicv1alpha1 "github.com/metal3-io/ironic-standalone-operator/api/v1alpha1"
 	"go.uber.org/zap/zapcore"
 	k8sruntime "k8s.io/apimachinery/pkg/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
@@ -43,7 +47,6 @@ import (
 	cliflag "k8s.io/component-base/cli/flag"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/cache"
-	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	"sigs.k8s.io/controller-runtime/pkg/metrics/filters"
@@ -58,9 +61,22 @@ const (
 )
 
 type TLSOptions struct {
-	TLSMaxVersion   string
-	TLSMinVersion   string
-	TLSCipherSuites string
+	TLSMaxVersion       string
+	TLSMinVersion       string
+	TLSCipherSuites     string
+	TLSCurvePreferences string
+}
+
+// Supported TLS Curves mapping for go1.26, make sure to update it
+// when go version is updated.
+var supportedTLSCurvesPreferences = map[string]tls.CurveID{
+	"X25519":             tls.X25519,
+	"CurveP256":          tls.CurveP256,
+	"CurveP384":          tls.CurveP384,
+	"CurveP521":          tls.CurveP521,
+	"X25519MLKEM768":     tls.X25519MLKEM768,
+	"SecP256r1MLKEM768":  tls.SecP256r1MLKEM768,
+	"SecP384r1MLKEM1024": tls.SecP384r1MLKEM1024,
 }
 
 var (
@@ -73,16 +89,27 @@ var (
 
 const leaderElectionID = "baremetal-operator"
 
+const (
+	defaultProvisionerName      = "ironic"
+	defaultProvisionerPluginDir = "/plugins"
+	provisionerPluginSuffix     = "-provisioner.so"
+	// provisionerNameFixture is compiled in, so selecting it skips plugin loading.
+	provisionerNameFixture = "fixture"
+)
+
+// provisionerNameRE rejects flag values that would let filepath.Join escape
+// the plugin directory.
+var provisionerNameRE = regexp.MustCompile(`^[a-z0-9][a-z0-9-]*$`)
+
 func init() {
 	_ = clientgoscheme.AddToScheme(scheme)
 
 	_ = metal3api.AddToScheme(scheme)
-	_ = ironicv1alpha1.AddToScheme(scheme)
 }
 
 func printVersion() {
 	setupLog.Info("Go Version: " + runtime.Version())
-	setupLog.Info(fmt.Sprintf("Go OS/Arch: %s/%s", runtime.GOOS, runtime.GOARCH))
+	setupLog.Info("Go OS/Arch", "goos", runtime.GOOS, "goarch", runtime.GOARCH)
 	setupLog.Info("Git commit: " + version.Commit)
 	setupLog.Info("Build time: " + version.BuildTime)
 	setupLog.Info("Component: " + version.String)
@@ -113,7 +140,7 @@ func setupWebhookReadinessCheck(mgr ctrl.Manager) {
 	}
 }
 
-func setupWebhooks(mgr ctrl.Manager) {
+func setupWebhooks(ctx context.Context, mgr ctrl.Manager) {
 	if err := (&webhooks.BareMetalHost{}).SetupWebhookWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create webhook", "webhook", "BareMetalHost")
 		os.Exit(1)
@@ -123,6 +150,26 @@ func setupWebhooks(mgr ctrl.Manager) {
 		setupLog.Error(err, "unable to create webhook", "webhook", "BareMetalHost")
 		os.Exit(1)
 	}
+
+	if err := (&webhooks.HostClaimWebhook{}).SetupWebhookWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to create webhook", "webhook", "HostClaim")
+		os.Exit(1)
+	}
+
+	if err := (&webhooks.HostNetworkAttachment{}).SetupWebhookWithManager(ctx, mgr); err != nil {
+		setupLog.Error(err, "unable to create webhook", "webhook", "HostNetworkAttachment")
+		os.Exit(1)
+	}
+
+	if err := (&webhooks.DataImage{}).SetupWebhookWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to create webhook", "webhook", "DataImage")
+		os.Exit(1)
+	}
+
+	if err := (&webhooks.HostFirmwareComponents{}).SetupWebhookWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to create webhook", "webhook", "HostFirmwareComponents")
+		os.Exit(1)
+	}
 }
 
 func main() {
@@ -130,17 +177,23 @@ func main() {
 	var metricsBindAddr string
 	var enableLeaderElection bool
 	var preprovImgEnable bool
+	var hostClaimsEnable bool
 	var devLogging bool
-	var runInTestMode bool
-	var runInDemoMode bool
+	var provisionerName string
 	var webhookPort int
 	var restConfigQPS float64
 	var restConfigBurst int
 	var controllerConcurrency int
+	var maxProvisioningRetries int
 	var leaseDurationSeconds string
 	var renewDeadlineSeconds string
 	var retryPeriodSeconds string
 	var useFailureDomainAsConductorGroup bool
+
+	var supportedTLSCurvesNames = make([]string, 0, len(supportedTLSCurvesPreferences))
+	for name := range supportedTLSCurvesPreferences {
+		supportedTLSCurvesNames = append(supportedTLSCurvesNames, name)
+	}
 
 	// From CAPI point of view, BMO should be able to watch all namespaces
 	// in case of a deployment that is not multi-tenant. If the deployment
@@ -154,10 +207,13 @@ func main() {
 		"Enable leader election for controller manager. "+
 			"Enabling this will ensure there is only one active controller manager.")
 	flag.BoolVar(&preprovImgEnable, "build-preprov-image", false, "enable integration with the PreprovisioningImage API")
+	flag.BoolVar(&hostClaimsEnable, "hostclaims", false, "enable HostClaims controller")
 	flag.BoolVar(&devLogging, "dev", false, "enable developer logging")
-	flag.BoolVar(&runInTestMode, "test-mode", false, "disable ironic communication")
-	flag.BoolVar(&runInDemoMode, "demo-mode", false,
-		"use the demo provisioner to set host states")
+	flag.StringVar(&provisionerName, "provisioner", defaultProvisionerName,
+		"Name of the provisioner plugin to load. Resolves to "+
+			"$PROVISIONER_PLUGIN_DIR/<name>"+provisionerPluginSuffix+
+			" (default dir "+defaultProvisionerPluginDir+"). "+
+			"Use "+provisionerNameFixture+" for the compiled-in fixture provisioner.")
 	flag.StringVar(&healthAddr, "health-addr", ":9440",
 		"The address the health endpoint binds to.")
 	flag.IntVar(&webhookPort, "webhook-port", 9443, //nolint:mnd
@@ -182,8 +238,14 @@ func main() {
 			"If omitted, the default Go cipher suites will be used. \n"+
 			"Preferred values: "+strings.Join(tlsCipherPreferredValues, ", ")+". \n"+
 			"Insecure values: "+strings.Join(tlsCipherInsecureValues, ", ")+".")
+	flag.StringVar(&tlsOptions.TLSCurvePreferences, "tls-curve-preferences", "",
+		"Comma-separated list of curve/group preferences for the webhook and metrics servers. "+
+			"If omitted, the default Go curve preferences will be used. "+
+			"Possible values: "+strings.Join(supportedTLSCurvesNames, ", ")+".")
 	flag.IntVar(&controllerConcurrency, "controller-concurrency", 0,
 		"Number of CRs of each type to process simultaneously")
+	flag.IntVar(&maxProvisioningRetries, "max-provisioning-retries", 5, //nolint:mnd
+		"Maximum number of provisioning retries before giving up. Set to 0 to disable the limit (infinite retries).")
 
 	flag.StringVar(&leaseDurationSeconds, "lease-duration-seconds", os.Getenv("LEASE_DURATION_SECONDS"), "Leader election duration in seconds.")
 	flag.StringVar(&renewDeadlineSeconds, "renew-deadline-seconds", os.Getenv("RENEW_DEADLINE_SECONDS"), "Leader election renew deadline duration in seconds.")
@@ -192,6 +254,12 @@ func main() {
 		"Use failure domain label as Ironic conductor group")
 
 	flag.Parse()
+
+	// The ironic provisioner plugin reads its configuration from the
+	// environment; bridge the conductor-group flag so it keeps working.
+	if useFailureDomainAsConductorGroup {
+		_ = os.Setenv("USE_FAILURE_DOMAIN_AS_CONDUCTOR_GROUP", "true")
+	}
 
 	logOpts := zap.Options{}
 	if devLogging {
@@ -203,6 +271,54 @@ func main() {
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&logOpts)))
 
 	printVersion()
+
+	var hostFeatures []provisioner.HostFeature
+	if preprovImgEnable {
+		hostFeatures = append(hostFeatures, provisioner.FeaturePreprovisioningImage)
+	}
+
+	// Default namespace for the provisioner, overridable by the plugin.
+	provisionerNamespace := cmp.Or(os.Getenv("POD_NAMESPACE"), watchNamespace)
+
+	// Open the plugin before any K8s I/O so a bad path fails fast.
+	var provisionerPlugin *provisioner.Plugin
+	var pluginRequirements provisioner.HostRequirements
+	if provisionerName != provisionerNameFixture {
+		if !provisionerNameRE.MatchString(provisionerName) {
+			setupLog.Error(fmt.Errorf("invalid provisioner name %q", provisionerName),
+				"provisioner name must match "+provisionerNameRE.String())
+			os.Exit(1)
+		}
+		pluginDir := cmp.Or(os.Getenv("PROVISIONER_PLUGIN_DIR"), defaultProvisionerPluginDir)
+		pluginPath := filepath.Join(pluginDir, provisionerName+provisionerPluginSuffix)
+		p, err := provisioner.Open(pluginPath, provisionerName)
+		if err != nil {
+			setupLog.Error(err, "cannot load provisioner plugin",
+				"name", provisionerName, "dir", pluginDir, "path", pluginPath)
+			os.Exit(1)
+		}
+		provisionerPlugin = p
+		setupLog.Info("loaded provisioner plugin",
+			"name", provisionerPlugin.Name(), "path", provisionerPlugin.Path())
+
+		pluginRequirements, err = provisionerPlugin.HostConfigure(provisioner.HostConfigureInput{
+			Logger:               setupLog,
+			Features:             hostFeatures,
+			ProvisionerNamespace: provisionerNamespace,
+		})
+		if err != nil {
+			setupLog.Error(err, "plugin HostConfigure failed",
+				"name", provisionerPlugin.Name(), "path", provisionerPlugin.Path())
+			os.Exit(1)
+		}
+		if pluginRequirements.AddToScheme != nil {
+			if err := pluginRequirements.AddToScheme(scheme); err != nil {
+				setupLog.Error(err, "plugin AddToScheme failed",
+					"name", provisionerPlugin.Name())
+				os.Exit(1)
+			}
+		}
+	}
 
 	enableWebhook := webhookPort != 0
 
@@ -234,24 +350,6 @@ func main() {
 		setupLog.Info("Manager set up with cluster scope")
 	}
 
-	// Setup cache options
-	var byObject map[client.Object]cache.ByObject
-
-	ironicName := os.Getenv("IRONIC_NAME")
-	ironicNamespace := os.Getenv("IRONIC_NAMESPACE")
-	if ironicNamespace == "" {
-		ironicNamespace = leaderElectionNamespace
-	}
-	if ironicName != "" && ironicNamespace != "" {
-		byObject = map[client.Object]cache.ByObject{
-			&ironicv1alpha1.Ironic{}: {
-				Namespaces: map[string]cache.Config{
-					ironicNamespace: {},
-				},
-			},
-		}
-	}
-
 	ctrlOpts := ctrl.Options{
 		Scheme: scheme,
 		Metrics: metricsserver.Options{
@@ -270,7 +368,7 @@ func main() {
 		LeaderElectionReleaseOnCancel: true,
 		HealthProbeBindAddress:        healthAddr,
 		Cache: cache.Options{
-			ByObject:          secretutils.AddSecretSelector(byObject),
+			ByObject:          secretutils.AddSecretSelector(pluginRequirements.CacheByObject),
 			DefaultNamespaces: watchNamespaces,
 		},
 	}
@@ -317,23 +415,20 @@ func main() {
 	}
 
 	var provisionerFactory provisioner.Factory
-	if runInTestMode {
-		ctrl.Log.Info("using test provisioner")
+	if provisionerName == provisionerNameFixture {
+		ctrl.Log.Info("using fixture provisioner")
 		provisionerFactory = &fixture.Fixture{}
-	} else if runInDemoMode {
-		ctrl.Log.Info("using demo provisioner")
-		provisionerFactory = &demo.Demo{}
 	} else {
 		provLog := zap.New(zap.UseFlagOptions(&logOpts)).WithName("provisioner")
-		// Check if we should use Ironic CR integration
-		if ironicName != "" && ironicNamespace != "" {
-			provisionerFactory, err = ironic.NewProvisionerFactoryWithClient(provLog, preprovImgEnable, useFailureDomainAsConductorGroup,
-				mgr.GetClient(), mgr.GetAPIReader(), ironicName, ironicNamespace)
-		} else {
-			provisionerFactory, err = ironic.NewProvisionerFactory(provLog, preprovImgEnable, useFailureDomainAsConductorGroup)
-		}
+		provisionerFactory, err = provisionerPlugin.NewFactory(provisioner.PluginConfig{
+			Logger:               provLog,
+			Features:             hostFeatures,
+			K8sClient:            mgr.GetClient(),
+			APIReader:            mgr.GetAPIReader(),
+			ProvisionerNamespace: provisionerNamespace,
+		})
 		if err != nil {
-			setupLog.Error(err, "cannot start ironic provisioner")
+			setupLog.Error(err, "cannot initialize provisioner plugin", "path", provisionerPlugin.Path())
 			os.Exit(1)
 		}
 	}
@@ -344,18 +439,25 @@ func main() {
 		os.Exit(1)
 	}
 
+	if maxProvisioningRetries < 0 {
+		setupLog.Error(fmt.Errorf("invalid value %d", maxProvisioningRetries),
+			"--max-provisioning-retries must be 0 (unlimited) or a positive integer")
+		os.Exit(1)
+	}
+
 	if err = (&metal3iocontroller.BareMetalHostReconciler{
-		Client:             mgr.GetClient(),
-		Log:                ctrl.Log.WithName("controllers").WithName("BareMetalHost"),
-		ProvisionerFactory: provisionerFactory,
-		APIReader:          mgr.GetAPIReader(),
+		Client:                 mgr.GetClient(),
+		Log:                    ctrl.Log.WithName("controllers").WithName("BareMetalHost"),
+		ProvisionerFactory:     provisionerFactory,
+		APIReader:              mgr.GetAPIReader(),
+		MaxProvisioningRetries: maxProvisioningRetries,
 	}).SetupWithManager(mgr, preprovImgEnable, maxConcurrency); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "BareMetalHost")
 		os.Exit(1)
 	}
 
 	if preprovImgEnable {
-		imgReconciler := metal3iocontroller.PreprovisioningImageReconciler{
+		imgReconciler := ppicontroller.PreprovisioningImageReconciler{
 			Client:        mgr.GetClient(),
 			Log:           ctrl.Log.WithName("controllers").WithName("PreprovisioningImage"),
 			APIReader:     mgr.GetAPIReader(),
@@ -369,13 +471,20 @@ func main() {
 			}
 		}
 	}
-	if err = (&metal3iocontroller.HostClaimReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
-	}).SetupWithManager(mgr); err != nil {
-		setupLog.Error(err, "unable to create controller", "controller", "HostClaim")
-		os.Exit(1)
+
+	if hostClaimsEnable {
+		if err = (&metal3iocontroller.HostClaimReconciler{
+			Client:              mgr.GetClient(),
+			Log:                 ctrl.Log.WithName("controllers").WithName("HostClaim"),
+			Scheme:              mgr.GetScheme(),
+			APIReader:           mgr.GetAPIReader(),
+			NewHostClaimManager: hostclaim.NewManager,
+		}).SetupWithManager(mgr); err != nil {
+			setupLog.Error(err, "unable to create controller", "controller", "HostClaim")
+			os.Exit(1)
+		}
 	}
+
 	// +kubebuilder:scaffold:builder
 
 	if err = (&metal3iocontroller.HostFirmwareSettingsReconciler{
@@ -414,15 +523,55 @@ func main() {
 		os.Exit(1)
 	}
 
+	networkingEnabledValue := os.Getenv("IRONIC_NETWORKING_ENABLED")
+	networkingEnabled, err := strconv.ParseBool(networkingEnabledValue)
+	if err != nil && networkingEnabledValue != "" {
+		setupLog.Error(err, "invalid environment variable value", "name", "IRONIC_NETWORKING_ENABLED", "value", networkingEnabledValue)
+		os.Exit(1)
+	}
+	if networkingEnabled {
+		switchConfigsSecretName := os.Getenv("IRONIC_SWITCH_CONFIGS_SECRET")
+		if switchConfigsSecretName == "" {
+			setupLog.Error(errors.New("IRONIC_SWITCH_CONFIGS_SECRET must be set when IRONIC_NETWORKING_ENABLED=true"), "missing required environment variable")
+			os.Exit(1)
+		}
+
+		switchCredentialSecretName := os.Getenv("IRONIC_SWITCH_CREDENTIALS_SECRET")
+		if switchCredentialSecretName == "" {
+			setupLog.Error(errors.New("IRONIC_SWITCH_CREDENTIALS_SECRET must be set when IRONIC_NETWORKING_ENABLED=true"), "missing required environment variable")
+			os.Exit(1)
+		}
+
+		switchCredentialPath := os.Getenv("IRONIC_SWITCH_CREDENTIALS_PATH")
+		if switchCredentialPath == "" {
+			setupLog.Error(errors.New("IRONIC_SWITCH_CREDENTIALS_PATH must be set when IRONIC_NETWORKING_ENABLED=true"), "missing required environment variable")
+			os.Exit(1)
+		}
+
+		if err = (&metal3iocontroller.BareMetalSwitchReconciler{
+			Client:                     mgr.GetClient(),
+			Log:                        ctrl.Log.WithName("controllers").WithName("BareMetalSwitch"),
+			APIReader:                  mgr.GetAPIReader(),
+			SwitchConfigsSecretName:    switchConfigsSecretName,
+			SwitchCredentialSecretName: switchCredentialSecretName,
+			SwitchCredentialPath:       switchCredentialPath,
+		}).SetupWithManager(mgr, maxConcurrency); err != nil {
+			setupLog.Error(err, "unable to create controller", "controller", "BareMetalSwitch")
+			os.Exit(1)
+		}
+	}
+
 	setupChecks(mgr)
+
+	ctx := ctrl.SetupSignalHandler()
 
 	if enableWebhook {
 		setupWebhookReadinessCheck(mgr)
-		setupWebhooks(mgr)
+		setupWebhooks(ctx, mgr)
 	}
 
 	setupLog.Info("starting manager")
-	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
+	if err := mgr.Start(ctx); err != nil {
 		setupLog.Error(err, "problem running manager")
 		os.Exit(1)
 	}
@@ -478,7 +627,7 @@ func GetTLSOptionOverrideFuncs(options TLSOptions) ([]func(*tls.Config), error) 
 		for _, cipher := range tlsCipherSuites {
 			for _, insecureCipherName := range insecureCipherValues {
 				if insecureCipherName == cipher {
-					setupLog.Info(fmt.Sprintf("warning: use of insecure cipher '%s' detected.", cipher))
+					setupLog.Info("warning: use of insecure cipher detected", "cipher", cipher)
 				}
 			}
 		}
@@ -487,12 +636,28 @@ func GetTLSOptionOverrideFuncs(options TLSOptions) ([]func(*tls.Config), error) 
 		})
 	}
 
+	if options.TLSCurvePreferences != "" {
+		curveNames := strings.Split(options.TLSCurvePreferences, ",")
+		curves := make([]tls.CurveID, 0, len(curveNames))
+		for _, name := range curveNames {
+			name = strings.TrimSpace(name)
+			curveID, exists := supportedTLSCurvesPreferences[name]
+			if !exists {
+				return nil, fmt.Errorf("unrecognized TLS curve preference %q", name)
+			}
+			curves = append(curves, curveID)
+		}
+		tlsOptions = append(tlsOptions, func(cfg *tls.Config) {
+			cfg.CurvePreferences = curves
+		})
+	}
+
 	return tlsOptions, nil
 }
 
 func getMaxConcurrentReconciles(controllerConcurrency int) (int, error) {
 	if controllerConcurrency > 0 {
-		ctrl.Log.Info(fmt.Sprintf("controller concurrency will be set to %d according to command line flag", controllerConcurrency))
+		ctrl.Log.Info("controller concurrency set from command line flag", "concurrency", controllerConcurrency)
 		return controllerConcurrency, nil
 	} else if controllerConcurrency < 0 {
 		return 0, fmt.Errorf("controller concurrency value: %d is invalid", controllerConcurrency)
@@ -510,13 +675,13 @@ func getMaxConcurrentReconciles(controllerConcurrency int) (int, error) {
 			return 0, fmt.Errorf("BMO_CONCURRENCY value: %s is invalid: %w", mcrEnv, err)
 		}
 		if mcr > 0 {
-			ctrl.Log.Info(fmt.Sprintf("BMO_CONCURRENCY of %d is set via an environment variable", mcr))
+			ctrl.Log.Info("controller concurrency set from environment variable", "concurrency", mcr)
 			maxConcurrentReconciles = mcr
 		} else {
-			ctrl.Log.Info(fmt.Sprintf("Invalid BMO_CONCURRENCY value. Operator Concurrency will be set to a default value of %d", maxConcurrentReconciles))
+			ctrl.Log.Info("invalid BMO_CONCURRENCY value, using default", "default", maxConcurrentReconciles)
 		}
 	} else {
-		ctrl.Log.Info(fmt.Sprintf("Operator Concurrency will be set to a default value of %d", maxConcurrentReconciles))
+		ctrl.Log.Info("using default controller concurrency", "concurrency", maxConcurrentReconciles)
 	}
 	return maxConcurrentReconciles, nil
 }

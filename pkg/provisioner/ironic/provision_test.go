@@ -48,7 +48,7 @@ func TestProvision(t *testing.T) {
 				ProvisionState: string(nodes.DeployFail),
 				UUID:           nodeUUID,
 			}),
-			expectedRequestAfter:   10,
+			expectedRequestAfter:   3,
 			expectedDirty:          true,
 			expectedProvisionState: nodes.TargetActive,
 		},
@@ -66,7 +66,24 @@ func TestProvision(t *testing.T) {
 			}),
 			expectedRequestAfter: 0,
 			expectedDirty:        false,
-			expectedErrorMessage: "Image provisioning failed: no work today",
+			expectedErrorMessage: "Image provisioning failed (url: http://test-image, checksum: abcd): no work today",
+		},
+		{
+			name: "deployFail state - same OCI image",
+			ironic: testserver.NewIronic(t).WithDefaultResponses().Node(nodes.Node{
+				ProvisionState: string(nodes.DeployFail),
+				UUID:           nodeUUID,
+				InstanceInfo: map[string]any{
+					"image_source": "oci://quay.io/example/image@sha256:abc123",
+				},
+				LastError: "image not found",
+			}),
+			image: &metal3api.Image{
+				URL: "oci://quay.io/example/image@sha256:abc123",
+			},
+			expectedRequestAfter: 0,
+			expectedDirty:        false,
+			expectedErrorMessage: "Image provisioning failed (url: oci://quay.io/example/image@sha256:abc123): image not found",
 		},
 		{
 			name: "cleanFail state",
@@ -74,7 +91,7 @@ func TestProvision(t *testing.T) {
 				ProvisionState: string(nodes.CleanFail),
 				UUID:           nodeUUID,
 			}),
-			expectedRequestAfter:   10,
+			expectedRequestAfter:   3,
 			expectedDirty:          true,
 			expectedProvisionState: nodes.TargetManage,
 		},
@@ -84,7 +101,7 @@ func TestProvision(t *testing.T) {
 				ProvisionState: string(nodes.Manageable),
 				UUID:           nodeUUID,
 			}),
-			expectedRequestAfter:   10,
+			expectedRequestAfter:   3,
 			expectedDirty:          true,
 			expectedProvisionState: nodes.TargetProvide,
 		},
@@ -94,7 +111,7 @@ func TestProvision(t *testing.T) {
 				ProvisionState: string(nodes.Available),
 				UUID:           nodeUUID,
 			}),
-			expectedRequestAfter:   10,
+			expectedRequestAfter:   3,
 			expectedDirty:          true,
 			expectedProvisionState: nodes.TargetActive,
 		},
@@ -108,7 +125,7 @@ func TestProvision(t *testing.T) {
 				URL:        testImage.URL,
 				DiskFormat: ptr.To("live-iso"),
 			},
-			expectedRequestAfter:   10,
+			expectedRequestAfter:   3,
 			expectedDirty:          true,
 			expectedProvisionState: nodes.TargetActive,
 		},
@@ -122,7 +139,7 @@ func TestProvision(t *testing.T) {
 			customDeploy: &metal3api.CustomDeploy{
 				Method: "mine_memecoins",
 			},
-			expectedRequestAfter:   10,
+			expectedRequestAfter:   3,
 			expectedDirty:          true,
 			expectedProvisionState: nodes.TargetActive,
 		},
@@ -173,7 +190,7 @@ func TestProvision(t *testing.T) {
 				UUID:           nodeUUID,
 			}),
 			forceReboot:            true,
-			expectedRequestAfter:   10,
+			expectedRequestAfter:   3,
 			expectedDirty:          true,
 			expectedProvisionState: nodes.TargetDeleted,
 		},
@@ -330,7 +347,7 @@ func TestDeprovision(t *testing.T) {
 				ProvisionState: string(nodes.Manageable),
 				UUID:           nodeUUID,
 			}),
-			expectedRequestAfter: 10,
+			expectedRequestAfter: 3,
 			expectedDirty:        true,
 		},
 	}
@@ -1605,6 +1622,139 @@ func TestGetUpdateOptsForNodeSecureBoot(t *testing.T) {
 			assert.Equal(t, e.Value, update.Value, "%s does not match", e.Path)
 		})
 	}
+}
+
+func TestGetUpdateOptsForNodeOCIWithPullSecret(t *testing.T) {
+	eventPublisher := func(reason, message string) {}
+	auth := clients.AuthConfig{Type: clients.NoAuth}
+
+	host := makeHost()
+	host.Spec.Image.URL = "oci://quay.io/test/image:latest"
+	host.Spec.Image.Checksum = ""
+	host.Spec.Image.ChecksumType = ""
+
+	prov, err := newProvisionerWithSettings(host, bmc.Credentials{}, eventPublisher, "https://ironic.test", auth)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ironicNode := &nodes.Node{}
+
+	provData := provisioner.ProvisionData{
+		Image:           *host.Spec.Image,
+		BootMode:        metal3api.DefaultBootMode,
+		ImagePullSecret: "user:pass",
+	}
+	patches := prov.getInstanceUpdateOpts(ironicNode, provData).Updates
+
+	t.Logf("patches: %v", patches)
+
+	expected := []struct {
+		Path  string
+		Value any
+	}{
+		{
+			Path:  "/instance_info/image_source",
+			Value: "oci://quay.io/test/image:latest",
+		},
+		{
+			Path:  "/instance_info/image_pull_secret",
+			Value: "user:pass",
+		},
+	}
+
+	for _, e := range expected {
+		t.Run(e.Path, func(t *testing.T) {
+			var update nodes.UpdateOperation
+			for _, patch := range patches {
+				u, ok := patch.(nodes.UpdateOperation)
+				require.True(t, ok, "expected patch to be UpdateOperation")
+				if u.Path == e.Path {
+					update = u
+					break
+				}
+			}
+			if update.Path != e.Path {
+				t.Errorf("did not find %q in updates", e.Path)
+				return
+			}
+			assert.Equal(t, e.Value, update.Value, "%s does not match", e.Path)
+		})
+	}
+}
+
+func TestGetUpdateOptsForNodeOCIWithoutPullSecret(t *testing.T) {
+	eventPublisher := func(reason, message string) {}
+	auth := clients.AuthConfig{Type: clients.NoAuth}
+
+	host := makeHost()
+	host.Spec.Image.URL = "oci://quay.io/test/image:latest"
+	host.Spec.Image.Checksum = ""
+	host.Spec.Image.ChecksumType = ""
+
+	prov, err := newProvisionerWithSettings(host, bmc.Credentials{}, eventPublisher, "https://ironic.test", auth)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ironicNode := &nodes.Node{}
+
+	provData := provisioner.ProvisionData{
+		Image:    *host.Spec.Image,
+		BootMode: metal3api.DefaultBootMode,
+	}
+	patches := prov.getInstanceUpdateOpts(ironicNode, provData).Updates
+
+	t.Logf("patches: %v", patches)
+
+	found := false
+	for _, patch := range patches {
+		update, ok := patch.(nodes.UpdateOperation)
+		require.True(t, ok, "expected patch to be UpdateOperation")
+		if update.Path == "/instance_info/image_pull_secret" {
+			assert.Nil(t, update.Value, "image_pull_secret should be nil when no secret is provided")
+			found = true
+		}
+	}
+	assert.False(t, found, "image_pull_secret patch should not be present when no secret is provided")
+}
+
+func TestGetUpdateOptsForNodeOCIClearPullSecret(t *testing.T) {
+	eventPublisher := func(reason, message string) {}
+	auth := clients.AuthConfig{Type: clients.NoAuth}
+
+	host := makeHost()
+	host.Spec.Image.URL = "oci://quay.io/test/image:latest"
+	host.Spec.Image.Checksum = ""
+	host.Spec.Image.ChecksumType = ""
+
+	prov, err := newProvisionerWithSettings(host, bmc.Credentials{}, eventPublisher, "https://ironic.test", auth)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ironicNode := &nodes.Node{
+		InstanceInfo: map[string]any{
+			"image_source":      "oci://quay.io/test/old-image:v1",
+			"image_pull_secret": "old-user:old-pass",
+		},
+	}
+
+	provData := provisioner.ProvisionData{
+		Image:    *host.Spec.Image,
+		BootMode: metal3api.DefaultBootMode,
+	}
+	patches := prov.getInstanceUpdateOpts(ironicNode, provData).Updates
+
+	t.Logf("patches: %v", patches)
+
+	found := false
+	for _, patch := range patches {
+		update, ok := patch.(nodes.UpdateOperation)
+		require.True(t, ok, "expected patch to be UpdateOperation")
+		if update.Path == "/instance_info/image_pull_secret" {
+			assert.Equal(t, nodes.RemoveOp, update.Op, "image_pull_secret should be removed")
+			found = true
+		}
+	}
+	assert.True(t, found, "expected a RemoveOp patch for image_pull_secret")
 }
 
 func TestBuildCleanStepsForUpdateFirmware(t *testing.T) {

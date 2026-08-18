@@ -8,9 +8,14 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/go-logr/logr"
 	"github.com/gophercloud/gophercloud/v2"
+	"github.com/gophercloud/gophercloud/v2/openstack/baremetal/v1/drivers"
+	"github.com/gophercloud/gophercloud/v2/pagination"
+	. "github.com/metal3-io/baremetal-operator/pkg/logging"
 	"github.com/metal3-io/baremetal-operator/pkg/provisioner"
 	"github.com/metal3-io/baremetal-operator/pkg/provisioner/ironic/clients"
 	"github.com/metal3-io/baremetal-operator/pkg/secretutils"
@@ -20,6 +25,15 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
+
+var ironicProvisionerCacheDefaultTTL = 5 * time.Second
+
+type ironicProvisionerCache struct {
+	lock              sync.Mutex
+	expiresAt         time.Time
+	clientIronic      *gophercloud.ServiceClient
+	availableFeatures clients.AvailableFeatures
+}
 
 type ironicProvisionerFactory struct {
 	log    logr.Logger
@@ -36,33 +50,65 @@ type ironicProvisionerFactory struct {
 	// Ironic CR configuration
 	ironicName      string
 	ironicNamespace string
+
+	// Information to cache between reconciliations
+	cache    *ironicProvisionerCache
+	cacheTTL time.Duration
+
+	// HTTP client timeout for all requests to Ironic
+	clientTimeout time.Duration
 }
 
-func NewProvisionerFactory(logger logr.Logger, havePreprovImgBuilder, useFailureDomainAsConductorGroup bool) (provisioner.Factory, error) {
+func NewProvisionerFactory(logger logr.Logger, havePreprovImgBuilder bool) (provisioner.Factory, error) {
 	factory := ironicProvisionerFactory{
-		log: logger.WithName("ironic"),
+		log:   logger.WithName("ironic"),
+		cache: new(ironicProvisionerCache),
 	}
 
-	err := factory.init(havePreprovImgBuilder, useFailureDomainAsConductorGroup)
+	err := factory.init(havePreprovImgBuilder)
 	return factory, err
 }
 
-func NewProvisionerFactoryWithClient(logger logr.Logger, havePreprovImgBuilder, useFailureDomainAsConductorGroup bool, k8sClient client.Client, apiReader client.Reader, ironicName, ironicNamespace string) (provisioner.Factory, error) {
+func NewProvisionerFactoryWithClient(logger logr.Logger, havePreprovImgBuilder bool, k8sClient client.Client, apiReader client.Reader, ironicName, ironicNamespace string) (provisioner.Factory, error) {
 	factory := ironicProvisionerFactory{
 		log:             logger.WithName("ironic"),
+		cache:           new(ironicProvisionerCache),
 		k8sClient:       k8sClient,
 		apiReader:       apiReader,
 		ironicName:      ironicName,
 		ironicNamespace: ironicNamespace,
 	}
 
-	err := factory.init(havePreprovImgBuilder, useFailureDomainAsConductorGroup)
+	err := factory.init(havePreprovImgBuilder)
 	return factory, err
 }
 
-func (f *ironicProvisionerFactory) init(havePreprovImgBuilder, useFailureDomainAsConductorGroup bool) error {
+func (f *ironicProvisionerFactory) init(havePreprovImgBuilder bool) error {
 	var err error
-	f.config, err = loadConfigFromEnv(havePreprovImgBuilder, useFailureDomainAsConductorGroup)
+
+	if cacheTTLString := os.Getenv("IRONIC_CLIENT_CACHE_TTL"); cacheTTLString != "" {
+		f.cacheTTL, err = time.ParseDuration(cacheTTLString)
+		if err != nil {
+			return fmt.Errorf("invalid IRONIC_CLIENT_CACHE_TTL %q: %w", cacheTTLString, err)
+		}
+		if f.cacheTTL < 0 {
+			return fmt.Errorf("invalid IRONIC_CLIENT_CACHE_TTL %q: must be >= 0", cacheTTLString)
+		}
+	} else {
+		f.cacheTTL = ironicProvisionerCacheDefaultTTL
+	}
+
+	if timeoutString := os.Getenv("IRONIC_CLIENT_TIMEOUT"); timeoutString != "" {
+		f.clientTimeout, err = time.ParseDuration(timeoutString)
+		if err != nil {
+			return fmt.Errorf("invalid IRONIC_CLIENT_TIMEOUT %q: %w", timeoutString, err)
+		}
+		if f.clientTimeout <= 0 {
+			return fmt.Errorf("invalid IRONIC_CLIENT_TIMEOUT %q: must be > 0", timeoutString)
+		}
+	}
+
+	f.config, err = loadConfigFromEnv(havePreprovImgBuilder)
 	if err != nil {
 		return err
 	}
@@ -111,9 +157,98 @@ func (f *ironicProvisionerFactory) init(havePreprovImgBuilder, useFailureDomainA
 		"SkipClientSANVerify", tlsConf.SkipClientSANVerify,
 	)
 
-	f.clientIronic, err = clients.IronicClient(ironicEndpoint, ironicAuth, tlsConf)
+	f.clientIronic, err = clients.IronicClient(ironicEndpoint, ironicAuth, tlsConf, f.clientTimeout)
 	if err != nil {
 		return err
+	}
+
+	return nil
+}
+
+func (f ironicProvisionerFactory) refreshCache(ctx context.Context, createClient func() (*gophercloud.ServiceClient, error)) (*gophercloud.ServiceClient, clients.AvailableFeatures, error) {
+	enableCache := f.cacheTTL > 0
+	if enableCache {
+		f.cache.lock.Lock()
+		defer f.cache.lock.Unlock()
+
+		isExpired := time.Now().After(f.cache.expiresAt)
+		if f.cache.clientIronic != nil && f.cache.availableFeatures.MaxVersion != 0 && !isExpired {
+			return f.cache.clientIronic, f.cache.availableFeatures, nil // cache is up-to-date
+		}
+
+		f.log.V(VerbosityLevelDebug).Info("client cache expired, refreshing", "TTL", f.cacheTTL, "HasGlobalClient", f.ironicName == "")
+	} else {
+		f.log.V(VerbosityLevelDebug).Info("creating and verifying a client (cache disabled)", "HasGlobalClient", f.ironicName == "")
+	}
+
+	newClient, err := createClient()
+	if err != nil {
+		return nil, clients.AvailableFeatures{}, err
+	}
+
+	// NOTE(dtantsur): verify the connection by checking the available feature and
+	// the list of enabled drivers (which is indicative of the conductor health).
+	// We do it without lifting the lock since the goal here is to reduce the load on Ironic.
+	// If the lock is lifted, all concurrent reconcilers will do the same requests.
+
+	availableFeatures, err := f.initAvailableFeature(ctx, newClient)
+	if err != nil {
+		return nil, clients.AvailableFeatures{}, err
+	}
+
+	err = f.checkIronicConductor(ctx, newClient)
+	if err != nil {
+		return nil, clients.AvailableFeatures{}, err
+	}
+
+	if enableCache {
+		// NOTE(dtantsur): the cache is only updated on success. If validation
+		// fails, the cache stays expired until the next try.
+		f.cache.clientIronic = newClient
+		f.cache.availableFeatures = availableFeatures
+		f.cache.expiresAt = time.Now().Add(f.cacheTTL)
+	}
+
+	return newClient, availableFeatures, nil
+}
+
+func (f ironicProvisionerFactory) initAvailableFeature(ctx context.Context, client *gophercloud.ServiceClient) (clients.AvailableFeatures, error) {
+	availableFeatures, err := clients.GetAvailableFeatures(ctx, client)
+	if err != nil {
+		f.log.Info("error caught while checking endpoint, will retry", "endpoint", client.Endpoint, "error", err)
+		return clients.AvailableFeatures{}, fmt.Errorf("%w: cannot reach ironic endpoint", provisioner.ErrNotReady)
+	}
+
+	client.Microversion = availableFeatures.ChooseMicroversion()
+	availableFeatures.Log(f.log.V(1))
+
+	return availableFeatures, nil
+}
+
+func (f ironicProvisionerFactory) checkIronicConductor(ctx context.Context, client *gophercloud.ServiceClient) error {
+	pager := drivers.ListDrivers(client, drivers.ListDriversOpts{
+		Detail: false,
+	})
+	if pager.Err != nil {
+		return pager.Err
+	}
+
+	driverCount := 0
+	err := pager.EachPage(ctx, func(_ context.Context, page pagination.Page) (bool, error) {
+		actual, driverErr := drivers.ExtractDrivers(page)
+		if driverErr != nil {
+			return false, driverErr
+		}
+		driverCount += len(actual)
+		return true, nil
+	})
+	if err != nil {
+		f.log.Error(err, "Unexpected error from the drivers API, still initializing?")
+		return fmt.Errorf("%w: unexpected error from the drivers API", provisioner.ErrNotReady)
+	}
+
+	if driverCount == 0 {
+		return fmt.Errorf("%w: no drivers loaded in ironic", provisioner.ErrNotReady)
 	}
 
 	return nil
@@ -122,29 +257,50 @@ func (f *ironicProvisionerFactory) init(havePreprovImgBuilder, useFailureDomainA
 func (f ironicProvisionerFactory) ironicProvisioner(ctx context.Context, hostData provisioner.HostData, publisher provisioner.EventPublisher) (*ironicProvisioner, error) {
 	provisionerLogger := f.log.WithValues("host", ironicNodeName(hostData.ObjectMeta))
 
-	var ironicClient *gophercloud.ServiceClient
+	var createClient func() (*gophercloud.ServiceClient, error)
 
 	// Check if we should use Ironic CR configuration (fetch fresh config on each provisioner creation)
 	if f.ironicName != "" && f.ironicNamespace != "" && f.k8sClient != nil {
-		ironicEndpoint, ironicAuth, tlsConf, err := f.loadConfigFromIronicCR(ctx)
-		if err != nil {
-			return nil, fmt.Errorf("failed to load configuration from Ironic resource %s/%s: %w", f.ironicNamespace, f.ironicName, err)
-		}
+		createClient = func() (*gophercloud.ServiceClient, error) {
+			ironicEndpoint, ironicAuth, tlsConf, err := f.loadConfigFromIronicCR(ctx)
+			// NOTE(dtantsur): the file may be created even if an error is returned, so plan deletion before checking err.
+			if tlsConf.TrustedCAFileIsTemporary {
+				defer func() {
+					if rmErr := os.Remove(tlsConf.TrustedCAFile); rmErr != nil && !os.IsNotExist(rmErr) {
+						provisionerLogger.Error(rmErr, "failed to remove temporary CA file", "file", tlsConf.TrustedCAFile)
+					}
+				}()
+			}
+			if err != nil {
+				return nil, fmt.Errorf("failed to load configuration from Ironic resource %s/%s: %w", f.ironicNamespace, f.ironicName, err)
+			}
 
-		provisionerLogger.Info("ironic settings from Ironic resource",
-			"ironicName", f.ironicName,
-			"ironicNamespace", f.ironicNamespace,
-			"endpoint", ironicEndpoint,
-			"CACertFile", tlsConf.TrustedCAFile,
-		)
+			provisionerLogger.Info("ironic settings from Ironic resource",
+				"ironicName", f.ironicName,
+				"ironicNamespace", f.ironicNamespace,
+				"endpoint", ironicEndpoint,
+				"CACertFile", tlsConf.TrustedCAFile,
+			)
 
-		ironicClient, err = clients.IronicClient(ironicEndpoint, ironicAuth, tlsConf)
-		if err != nil {
-			return nil, fmt.Errorf("failed to create a client from Ironic resource %s/%s: %w", f.ironicNamespace, f.ironicName, err)
+			ironicClient, err := clients.IronicClient(ironicEndpoint, ironicAuth, tlsConf, f.clientTimeout)
+			if err != nil {
+				return nil, fmt.Errorf("failed to create a client from Ironic resource %s/%s: %w", f.ironicNamespace, f.ironicName, err)
+			}
+			return ironicClient, nil
 		}
 	} else {
 		// Use the pre-configured client from environment variables
-		ironicClient = f.clientIronic
+		createClient = func() (*gophercloud.ServiceClient, error) {
+			// NOTE(dtantsur): refreshCache mutates the client by setting Microversion.
+			// Make a shallow copy of the global client object to avoid data races.
+			clientCopy := *f.clientIronic
+			return &clientCopy, nil
+		}
+	}
+
+	clientIronic, availableFeatures, err := f.refreshCache(ctx, createClient)
+	if err != nil {
+		return nil, err
 	}
 
 	p := &ironicProvisioner{
@@ -155,10 +311,11 @@ func (f ironicProvisionerFactory) ironicProvisioner(ctx context.Context, hostDat
 		bmcAddress:              hostData.BMCAddress,
 		disableCertVerification: hostData.DisableCertificateVerification,
 		bootMACAddress:          hostData.BootMACAddress,
-		client:                  ironicClient,
+		client:                  clientIronic,
 		log:                     provisionerLogger,
 		debugLog:                provisionerLogger.V(1),
 		publisher:               publisher,
+		availableFeatures:       availableFeatures,
 	}
 
 	return p, nil
@@ -166,14 +323,15 @@ func (f ironicProvisionerFactory) ironicProvisioner(ctx context.Context, hostDat
 
 // NewProvisioner returns a new Ironic Provisioner using the global
 // configuration for finding the Ironic services.
+// Returns provisioner.ErrNotReady if Ironic is not available yet.
 func (f ironicProvisionerFactory) NewProvisioner(ctx context.Context, hostData provisioner.HostData, publisher provisioner.EventPublisher) (provisioner.Provisioner, error) {
 	return f.ironicProvisioner(ctx, hostData, publisher)
 }
 
-func loadConfigFromEnv(havePreprovImgBuilder, useFailureDomainAsConductorGroup bool) (ironicConfig, error) {
+func loadConfigFromEnv(havePreprovImgBuilder bool) (ironicConfig, error) {
 	c := ironicConfig{
 		havePreprovImgBuilder:            havePreprovImgBuilder,
-		useFailureDomainAsConductorGroup: useFailureDomainAsConductorGroup,
+		useFailureDomainAsConductorGroup: os.Getenv("USE_FAILURE_DOMAIN_AS_CONDUCTOR_GROUP") == "true",
 	}
 
 	c.deployKernelURL = os.Getenv("DEPLOY_KERNEL_URL")
@@ -302,19 +460,21 @@ func (f *ironicProvisionerFactory) loadConfigFromIronicCR(ctx context.Context) (
 
 	endpoint = fmt.Sprintf("http://%s.%s.svc", f.ironicName, f.ironicNamespace)
 
-	// Handle TLS
+	// Handle authentication
+	auth, err = f.loadAuthConfigFromIronicCR(ctx, &sm, ironicCR)
+	if err != nil {
+		return "", clients.AuthConfig{}, clients.TLSConfig{}, err
+	}
+
+	// Handle TLS.
+	// Do it last because it may create a temporary file that will need to be cleaned up
+	// by the caller even in case of an error.
 	if ironicCR.Spec.TLS.CertificateName != "" {
 		endpoint = fmt.Sprintf("https://%s.%s.svc", f.ironicName, f.ironicNamespace)
 		tlsConfig, err = f.loadTLSConfigFromIronicCR(ctx, &sm, ironicCR)
 		if err != nil {
 			return "", clients.AuthConfig{}, clients.TLSConfig{}, err
 		}
-	}
-
-	// Handle authentication
-	auth, err = f.loadAuthConfigFromIronicCR(ctx, &sm, ironicCR)
-	if err != nil {
-		return "", clients.AuthConfig{}, clients.TLSConfig{}, err
 	}
 
 	return endpoint, auth, tlsConfig, nil
@@ -366,6 +526,7 @@ func (f *ironicProvisionerFactory) loadTLSConfigFromIronicCR(ctx context.Context
 			return clients.TLSConfig{}, fmt.Errorf("failed to write CA certificate: %w", err)
 		}
 		tlsConfig.TrustedCAFile = caFile
+		tlsConfig.TrustedCAFileIsTemporary = true
 	}
 
 	return tlsConfig, nil
@@ -378,10 +539,15 @@ func writeTempFile(prefix string, data []byte) (string, error) {
 	}
 	defer tmpFile.Close()
 
+	name := tmpFile.Name()
 	_, err = tmpFile.Write(data)
 	if err != nil {
+		if rmErr := os.Remove(name); rmErr != nil && !os.IsNotExist(rmErr) { //nolint:gosec // name is from os.CreateTemp, not user input
+			rmErr = fmt.Errorf("failed to delete temporary file during clean-up: %w", rmErr)
+			return "", errors.Join(err, rmErr)
+		}
 		return "", err
 	}
 
-	return tmpFile.Name(), nil
+	return name, nil
 }

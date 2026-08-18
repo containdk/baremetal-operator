@@ -804,6 +804,69 @@ func TestHasRebootAnnotation(t *testing.T) {
 	}
 }
 
+func TestClearRebootAnnotations(t *testing.T) {
+	testCases := []struct {
+		Scenario            string
+		Annotations         map[string]string
+		ExpectedAnnotations map[string]string
+		ExpectedDirty       bool
+	}{
+		{
+			Scenario: "Base reboot annotation",
+			Annotations: map[string]string{
+				metal3api.RebootAnnotationPrefix: "",
+			},
+			ExpectedAnnotations: map[string]string{},
+			ExpectedDirty:       true,
+		},
+		{
+			Scenario: "Suffixed reboot annotation",
+			Annotations: map[string]string{
+				metal3api.RebootAnnotationPrefix + "/foo": "",
+			},
+			ExpectedAnnotations: map[string]string{
+				metal3api.RebootAnnotationPrefix + "/foo": "",
+			},
+			ExpectedDirty: false,
+		},
+		{
+			Scenario: "Base and suffixed reboot annotations",
+			Annotations: map[string]string{
+				metal3api.RebootAnnotationPrefix:          "",
+				metal3api.RebootAnnotationPrefix + "/foo": "",
+				metal3api.RebootAnnotationPrefix + "/bar": "{\"mode\":\"hard\"}",
+			},
+			ExpectedAnnotations: map[string]string{
+				metal3api.RebootAnnotationPrefix + "/foo": "",
+				metal3api.RebootAnnotationPrefix + "/bar": "{\"mode\":\"hard\"}",
+			},
+			ExpectedDirty: true,
+		},
+		{
+			Scenario: "No reboot annotations",
+			Annotations: map[string]string{
+				"example.metal3.io/not-reboot": "true",
+			},
+			ExpectedAnnotations: map[string]string{
+				"example.metal3.io/not-reboot": "true",
+			},
+			ExpectedDirty: false,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.Scenario, func(t *testing.T) {
+			host := newDefaultHost(t)
+			host.Annotations = tc.Annotations
+
+			dirty := clearRebootAnnotations(host)
+
+			assert.Equal(t, tc.ExpectedDirty, dirty)
+			assert.Equal(t, tc.ExpectedAnnotations, host.Annotations)
+		})
+	}
+}
+
 // TestRebootWithSuffixlessAnnotation tests full reboot cycle with suffixless
 // annotation which doesn't wait for annotation removal before power on.
 func TestRebootWithSuffixlessAnnotation(t *testing.T) {
@@ -1581,7 +1644,56 @@ func TestExternallyProvisionedTransitions(t *testing.T) {
 		waitForProvisioningState(t, r, host, metal3api.StateExternallyProvisioned)
 	})
 
-	t.Run("externally provisioned to inspecting", func(t *testing.T) {
+	t.Run("externally provisioned to provisioned", func(t *testing.T) {
+		host := newDefaultHost(t)
+		host.Spec.Online = true
+		host.Spec.ExternallyProvisioned = true
+		host.Spec.Image = &metal3api.Image{URL: "foo", Checksum: "123"}
+		r := newTestReconciler(t, host)
+
+		waitForProvisioningState(t, r, host, metal3api.StateExternallyProvisioned)
+
+		host.Spec.ExternallyProvisioned = false
+		err := r.Update(t.Context(), host)
+		require.NoError(t, err)
+		t.Log("set externally provisioned to false")
+
+		tryReconcile(t, r, host,
+			func(host *metal3api.BareMetalHost, result reconcile.Result) bool {
+				return host.Status.Provisioning.State == metal3api.StateProvisioned &&
+					host.Status.Provisioning.Image.URL == "foo"
+			},
+		)
+		assert.Equal(t, "foo", host.Status.Provisioning.Image.URL)
+		assert.Equal(t, "123", host.Status.Provisioning.Image.Checksum)
+		assert.Nil(t, host.Status.Provisioning.CustomDeploy)
+	})
+
+	t.Run("externally provisioned to provisioned copies customDeploy to status", func(t *testing.T) {
+		host := newDefaultHost(t)
+		host.Spec.Online = true
+		host.Spec.ExternallyProvisioned = true
+		host.Spec.CustomDeploy = &metal3api.CustomDeploy{Method: "install_everything"}
+		r := newTestReconciler(t, host)
+
+		waitForProvisioningState(t, r, host, metal3api.StateExternallyProvisioned)
+
+		host.Spec.ExternallyProvisioned = false
+		err := r.Update(t.Context(), host)
+		require.NoError(t, err)
+
+		tryReconcile(t, r, host,
+			func(host *metal3api.BareMetalHost, result reconcile.Result) bool {
+				return host.Status.Provisioning.State == metal3api.StateProvisioned &&
+					host.Status.Provisioning.CustomDeploy != nil &&
+					host.Status.Provisioning.CustomDeploy.Method == "install_everything"
+			},
+		)
+		assert.Equal(t, "install_everything", host.Status.Provisioning.CustomDeploy.Method)
+		assert.Empty(t, host.Status.Provisioning.Image)
+	})
+
+	t.Run("externally provisioned without image deprovisions", func(t *testing.T) {
 		host := newDefaultHost(t)
 		host.Spec.Online = true
 		host.Spec.ExternallyProvisioned = true
@@ -1591,12 +1703,9 @@ func TestExternallyProvisionedTransitions(t *testing.T) {
 
 		host.Spec.ExternallyProvisioned = false
 		err := r.Update(t.Context(), host)
-		if err != nil {
-			t.Fatal(err)
-		}
-		t.Log("set externally provisioned to false")
+		require.NoError(t, err)
 
-		waitForProvisioningState(t, r, host, metal3api.StateInspecting)
+		waitForProvisioningState(t, r, host, metal3api.StateDeprovisioning)
 	})
 
 	t.Run("preparing to externally provisioned", func(t *testing.T) {
@@ -2556,6 +2665,7 @@ func TestGetPreprovImageCreateUpdate(t *testing.T) {
 	assert.Equal(t, getControllerArchitecture(), img.Spec.Architecture)
 	assert.Equal(t, secretName, img.Spec.NetworkDataName)
 	assert.Equal(t, "42", img.Labels["answer.metal3.io"])
+	assert.Contains(t, img.Finalizers, preprovisioningImageFinalizer)
 
 	newSecretName := "new_net_secret"
 	host.Spec.PreprovisioningNetworkDataName = newSecretName
@@ -2582,8 +2692,9 @@ func TestGetPreprovImage(t *testing.T) {
 	arch := getControllerArchitecture()
 	image := &metal3api.PreprovisioningImage{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      host.Name,
-			Namespace: namespace,
+			Name:       host.Name,
+			Namespace:  namespace,
+			Finalizers: []string{preprovisioningImageFinalizer},
 		},
 		Spec: metal3api.PreprovisioningImageSpec{
 			Architecture:  arch,
@@ -2692,6 +2803,80 @@ func TestGetPreprovImageBeingDeleted(t *testing.T) {
 	imgData, err := r.getPreprovImage(t.Context(), i, acceptFormats)
 	require.NoError(t, err)
 	assert.Nil(t, imgData)
+}
+
+func TestGetPreprovImageBeingDeletedWithFinalizer(t *testing.T) {
+	host := newDefaultHost(t)
+	imageURL := "http://example.test/image.iso"
+	acceptFormats := []metal3api.ImageFormat{metal3api.ImageFormatISO, metal3api.ImageFormatInitRD}
+	now := metav1.Now()
+	arch := getControllerArchitecture()
+	image := &metal3api.PreprovisioningImage{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              host.Name,
+			Namespace:         namespace,
+			DeletionTimestamp: &now,
+			Finalizers:        []string{preprovisioningImageFinalizer},
+		},
+		Spec: metal3api.PreprovisioningImageSpec{
+			Architecture:  arch,
+			AcceptFormats: acceptFormats,
+		},
+		Status: metal3api.PreprovisioningImageStatus{
+			Architecture: arch,
+			Format:       metal3api.ImageFormatISO,
+			ImageUrl:     imageURL,
+			Conditions: []metav1.Condition{
+				{
+					Type:   string(metal3api.ConditionImageReady),
+					Status: metav1.ConditionTrue,
+				},
+				{
+					Type:   string(metal3api.ConditionImageError),
+					Status: metav1.ConditionFalse,
+				},
+			},
+		},
+	}
+	r := newTestReconciler(t, host, image)
+	i := makeReconcileInfo(host)
+
+	imgData, err := r.getPreprovImage(t.Context(), i, acceptFormats)
+	require.NoError(t, err)
+	assert.NotNil(t, imgData)
+	assert.Equal(t, imageURL, imgData.ImageURL)
+	assert.Equal(t, metal3api.ImageFormatISO, imgData.Format)
+}
+
+func TestGetPreprovImageAddsFinalizerToExisting(t *testing.T) {
+	host := newDefaultHost(t)
+	arch := getControllerArchitecture()
+	acceptFormats := []metal3api.ImageFormat{metal3api.ImageFormatISO}
+	image := &metal3api.PreprovisioningImage{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      host.Name,
+			Namespace: namespace,
+		},
+		Spec: metal3api.PreprovisioningImageSpec{
+			Architecture:  arch,
+			AcceptFormats: acceptFormats,
+		},
+	}
+	r := newTestReconciler(t, host, image)
+	i := makeReconcileInfo(host)
+
+	// First call adds the finalizer and returns nil (triggers requeue)
+	imgData, err := r.getPreprovImage(t.Context(), i, acceptFormats)
+	require.NoError(t, err)
+	assert.Nil(t, imgData)
+
+	// Verify finalizer was added
+	img := metal3api.PreprovisioningImage{}
+	require.NoError(t, r.Client.Get(t.Context(), client.ObjectKey{
+		Name:      host.Name,
+		Namespace: host.Namespace,
+	}, &img))
+	assert.Contains(t, img.Finalizers, preprovisioningImageFinalizer)
 }
 
 func TestPreprovImageAvailable(t *testing.T) {
@@ -3349,5 +3534,205 @@ func TestComputeConditions(t *testing.T) {
 			require.NotNil(t, cond, "Healthy condition should always be set")
 			assert.Equal(t, metav1.ConditionUnknown, cond.Status, "Healthy should be Unknown when no health data is available")
 		})
+	}
+}
+
+// TestGetImageAuthSecret_OCIImageWithValidSecret tests that credentials are extracted
+// successfully when an OCI image has a valid auth secret configured.
+func TestGetImageAuthSecret_OCIImageWithValidSecret(t *testing.T) {
+	host := newDefaultHost(t)
+	host.Spec.Online = true
+	ociAuthSecretName := "oci-auth-secret"
+	host.Spec.Image = &metal3api.Image{
+		URL:               "oci://registry.example.com/repo/image:tag",
+		OCIAuthSecretName: &ociAuthSecretName,
+	}
+
+	// Create the OCI auth secret
+	ociSecret := createDockerConfigJSONSecretForTest(t, ociAuthSecretName, namespace, map[string]map[string]string{
+		"registry.example.com": {
+			"username": "testuser",
+			"password": "testpass",
+		},
+	})
+
+	r := newTestReconciler(t, host, ociSecret)
+
+	// Manually call getImageAuthSecret to test the function directly
+	credentials, err := r.getImageAuthSecret(t.Context(), host, host.Spec.Image)
+
+	require.NoError(t, err)
+	require.NotEmpty(t, credentials, "expected non-empty credentials")
+
+	// Verify credentials are in plain text username:password format
+	assert.Equal(t, "testuser:testpass", credentials)
+}
+
+// TestGetImageAuthSecret_OCIImageWithoutSecret tests that no error occurs
+// when an OCI image does not have an auth secret configured.
+func TestGetImageAuthSecret_OCIImageWithoutSecret(t *testing.T) {
+	host := newDefaultHost(t)
+	host.Spec.Online = true
+	host.Spec.Image = &metal3api.Image{
+		URL: "oci://registry.example.com/repo/image:tag",
+		// No OCIAuthSecretName set
+	}
+
+	r := newTestReconciler(t, host)
+
+	credentials, err := r.getImageAuthSecret(t.Context(), host, host.Spec.Image)
+
+	require.NoError(t, err)
+	assert.Empty(t, credentials, "expected empty credentials when no auth secret is configured")
+}
+
+// TestGetImageAuthSecret_OCIImageWithInvalidSecret tests the behavior when
+// the configured auth secret cannot be parsed or doesn't have valid credentials.
+func TestGetImageAuthSecret_OCIImageWithInvalidSecret(t *testing.T) {
+	host := newDefaultHost(t)
+	host.Spec.Online = true
+	ociAuthSecretName := "invalid-auth-secret"
+	host.Spec.Image = &metal3api.Image{
+		URL:               "oci://registry.example.com/repo/image:tag",
+		OCIAuthSecretName: &ociAuthSecretName,
+	}
+
+	// Create an invalid secret (wrong format)
+	invalidSecret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      ociAuthSecretName,
+			Namespace: namespace,
+		},
+		Type: corev1.SecretTypeDockerConfigJson,
+		Data: map[string][]byte{
+			// Missing proper dockerconfigjson format
+			corev1.DockerConfigJsonKey: []byte(`{"invalid": "json"}`),
+		},
+	}
+
+	r := newTestReconciler(t, host, invalidSecret)
+
+	credentials, err := r.getImageAuthSecret(t.Context(), host, host.Spec.Image)
+
+	require.Error(t, err, "expected error for invalid secret")
+	assert.Empty(t, credentials, "expected empty credentials for invalid secret")
+}
+
+// TestGetImageAuthSecret_OCIImageWithMissingSecret tests the behavior when
+// the configured auth secret doesn't exist.
+func TestGetImageAuthSecret_OCIImageWithMissingSecret(t *testing.T) {
+	host := newDefaultHost(t)
+	host.Spec.Online = true
+	ociAuthSecretName := "nonexistent-secret"
+	host.Spec.Image = &metal3api.Image{
+		URL:               "oci://registry.example.com/repo/image:tag",
+		OCIAuthSecretName: &ociAuthSecretName,
+	}
+
+	r := newTestReconciler(t, host)
+
+	credentials, err := r.getImageAuthSecret(t.Context(), host, host.Spec.Image)
+
+	require.Error(t, err, "expected error for missing secret")
+	assert.Empty(t, credentials, "expected empty credentials for missing secret")
+}
+
+// TestGetImageAuthSecret_NonOCIImageWithAuthSecret tests that auth secrets
+// are ignored for non-OCI images.
+func TestGetImageAuthSecret_NonOCIImageWithAuthSecret(t *testing.T) {
+	host := newDefaultHost(t)
+	host.Spec.Online = true
+	ociAuthSecretName := "oci-auth-secret"
+	host.Spec.Image = &metal3api.Image{
+		URL:               "http://example.com/image.qcow2", // Non-OCI URL
+		OCIAuthSecretName: &ociAuthSecretName,
+	}
+
+	// Create the auth secret even though it shouldn't be used
+	ociSecret := createDockerConfigJSONSecretForTest(t, ociAuthSecretName, namespace, map[string]map[string]string{
+		"registry.example.com": {
+			"username": "testuser",
+			"password": "testpass",
+		},
+	})
+
+	r := newTestReconciler(t, host, ociSecret)
+
+	credentials, err := r.getImageAuthSecret(t.Context(), host, host.Spec.Image)
+
+	require.NoError(t, err)
+	assert.Empty(t, credentials, "expected empty credentials for non-OCI image")
+}
+
+// TestGetImageAuthSecret_NilImage tests that the function handles nil image gracefully.
+func TestGetImageAuthSecret_NilImage(t *testing.T) {
+	host := newDefaultHost(t)
+	host.Spec.Online = true
+	host.Spec.Image = nil
+
+	r := newTestReconciler(t, host)
+
+	credentials, err := r.getImageAuthSecret(t.Context(), host, host.Spec.Image)
+
+	require.NoError(t, err)
+	assert.Empty(t, credentials, "expected empty credentials for nil image")
+}
+
+// TestGetImageAuthSecret_RegistryMismatch tests the behavior when the auth secret
+// doesn't contain credentials for the image's registry.
+func TestGetImageAuthSecret_RegistryMismatch(t *testing.T) {
+	host := newDefaultHost(t)
+	host.Spec.Online = true
+	ociAuthSecretName := "oci-auth-secret"
+	host.Spec.Image = &metal3api.Image{
+		URL:               "oci://registry.example.com/repo/image:tag",
+		OCIAuthSecretName: &ociAuthSecretName,
+	}
+
+	// Create secret with credentials for a different registry
+	ociSecret := createDockerConfigJSONSecretForTest(t, ociAuthSecretName, namespace, map[string]map[string]string{
+		"different-registry.com": {
+			"username": "testuser",
+			"password": "testpass",
+		},
+	})
+
+	r := newTestReconciler(t, host, ociSecret)
+
+	credentials, err := r.getImageAuthSecret(t.Context(), host, host.Spec.Image)
+
+	require.Error(t, err, "expected error when registry doesn't match")
+	assert.Empty(t, credentials, "expected empty credentials when registry doesn't match")
+}
+
+// Helper function to create a dockerconfigjson secret for testing.
+func createDockerConfigJSONSecretForTest(t *testing.T, name, ns string, auths map[string]map[string]string) *corev1.Secret {
+	t.Helper()
+	dockerAuths := make(map[string]interface{})
+	for registry, creds := range auths {
+		username := creds["username"]
+		password := creds["password"]
+		// Encode credentials as base64("username:password") in the Auth field
+		auth := base64.StdEncoding.EncodeToString([]byte(username + ":" + password))
+		dockerAuths[registry] = map[string]string{
+			"auth": auth,
+		}
+	}
+
+	dockerConfig := map[string]interface{}{
+		"auths": dockerAuths,
+	}
+	dockerConfigJSON, err := json.Marshal(dockerConfig)
+	require.NoError(t, err)
+
+	return &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: ns,
+		},
+		Type: corev1.SecretTypeDockerConfigJson,
+		Data: map[string][]byte{
+			corev1.DockerConfigJsonKey: dockerConfigJSON,
+		},
 	}
 }
