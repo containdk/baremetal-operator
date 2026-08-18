@@ -44,7 +44,10 @@ jobs:
         uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7
         with:
           context: .
-          platforms: linux/amd64,linux/arm64
+          # amd64-only for now: plugins need CGO, and multi-arch would build
+          # arm64 under QEMU emulation (very slow). Re-add linux/arm64 with a
+          # cross-toolchain (e.g. tonistiigi/xx) if arm64 support is needed.
+          platforms: linux/amd64
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
