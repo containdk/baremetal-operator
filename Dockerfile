@@ -23,27 +23,27 @@ ENV GO111MODULE=on
 
 # Build the manager binary
 FROM sdk AS builder
-ARG ARCH=amd64
+ARG TARGETARCH
 ARG SOURCE_GIT_COMMIT
 ARG BUILD_VERSION
 ARG LDFLAGS=-s -w
 ENV VERSION_URI="github.com/metal3-io/baremetal-operator/pkg/version"
-RUN GOOS=linux GOARCH=${ARCH} \
+RUN GOOS=linux GOARCH=${TARGETARCH} \
     go build -a -ldflags "${LDFLAGS} -X ${VERSION_URI}.Raw=${BUILD_VERSION} -X ${VERSION_URI}.Commit=${SOURCE_GIT_COMMIT} -X ${VERSION_URI}.BuildTime=$(date '+%Y-%m-%dT%H:%M:%S%z')" -o baremetal-operator main.go
 
 # Build the ironic provisioner plugin
 FROM sdk AS ironic-plugin-builder
-ARG ARCH=amd64
+ARG TARGETARCH
 ARG LDFLAGS=-s -w
-RUN GOOS=linux GOARCH=${ARCH} \
+RUN GOOS=linux GOARCH=${TARGETARCH} \
     go build -buildmode=plugin -ldflags "${LDFLAGS}" \
     -o ironic-provisioner.so ./pkg/provisioner/ironic/plugin/
 
 # Build the demo provisioner plugin
 FROM sdk AS demo-plugin-builder
-ARG ARCH=amd64
+ARG TARGETARCH
 ARG LDFLAGS=-s -w
-RUN GOOS=linux GOARCH=${ARCH} \
+RUN GOOS=linux GOARCH=${TARGETARCH} \
     go build -buildmode=plugin -ldflags "${LDFLAGS}" \
     -o demo-provisioner.so ./pkg/provisioner/demo/plugin/
 
